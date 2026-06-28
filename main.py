@@ -139,17 +139,20 @@ def load_data() -> dict:
             d["ticket_channels"] = {}
         # Neue Datenfelder
         if "schaden_historie" not in d:
-            d["schaden_historie"] = {}      # {customer_id: [{id, datum, geschaedigter, ...}]}
+            d["schaden_historie"] = {}
         if "ticket_stats" not in d:
-            d["ticket_stats"] = []          # [{type, opened_at, closed_at, duration_minutes, ...}]
+            d["ticket_stats"] = []
         if "mitarbeiter_status" not in d:
-            d["mitarbeiter_status"] = {}    # {user_id_str: {status, seit, notiz}}
+            d["mitarbeiter_status"] = {}
+        if "blacklist" not in d:
+            d["blacklist"] = {}   # {customer_id: {grund, added_by, added_at}}
         return d
     return {
         "customers": {}, "invoices": {}, "logs": [],
         "schadensmeldungen": {}, "pending_auszahlungen": {},
         "ticket_channels": {}, "schaden_historie": {},
-        "ticket_stats": [], "mitarbeiter_status": {}
+        "ticket_stats": [], "mitarbeiter_status": {},
+        "blacklist": {}
     }
 
 def save_data(d: dict):
@@ -179,14 +182,17 @@ def generate_auszahlung_id() -> str:
 #  Invisible-Border-Farbe: entspricht exakt dem Discord-Embed-Hintergrund
 #  (#2B2D31 Dark Mode) → der farbige Streifen links ist optisch nicht sichtbar.
 #  Alle visuellen Unterschiede kommen aus Titel, Beschreibung und Struktur.
-EMBED_COLOR = 0x2B2D31
+EMBED_COLOR = 0x393A41
+EMBED_ERROR = 0xC03A2B
+EMBED_WARNING = 0xE67E22
+EMBED_SUCCESS = 0x27AE5F
 
 # Legacy-Aliase (werden intern nicht mehr direkt genutzt, aber falls externe
 # Referenzen bestehen bleiben sie vorhanden)
 COLOR_PRIMARY = EMBED_COLOR
-COLOR_SUCCESS = EMBED_COLOR
-COLOR_WARNING = EMBED_COLOR
-COLOR_ERROR   = EMBED_COLOR
+COLOR_SUCCESS = EMBED_SUCCESS
+COLOR_WARNING = EMBED_WARNING
+COLOR_ERROR   = EMBED_ERROR
 COLOR_INFO    = EMBED_COLOR
 COLOR_DAMAGE  = EMBED_COLOR
 COLOR_CLAIM   = EMBED_COLOR
@@ -205,7 +211,7 @@ KUNDEN_ROLE_NAME = "Versicherungsnehmer"
 FOOTER_ICON  = "https://media.discordapp.net/attachments/1473692441726029874/1497915098310901861/IGv4.png?ex=69ef41a5&is=69edf025&hm=1840dd2e17a7eff7b28600d3ac2f4e3bc658ff0fb8f53f73e16292760088d87e&=&format=webp&quality=lossless&width=625&height=625"
 AUTOMOD_ICON = "https://media.discordapp.net/attachments/1473692441726029874/1473692787156455474/1072-automod.png?ex=699722dc&is=6995d15c&hm=08ad340d3673e1f1076cbf73d235ea3b0e8ef10b07abb8d24ea66d85c6b59edb&=&format=webp&quality=lossless&width=250&height=250"
 FOOTER_TEXT  = "Copyright © InsuranceGuard v4"
-AUTHOR_NAME  = "Deutsche Versicherungsgesellschaft"
+AUTHOR_NAME  = ""
 
 # ═══════════════════════════════════════════════════════
 #   HILFSFUNKTIONEN
@@ -593,7 +599,7 @@ async def _send_inactivity_warning(
     await channel.send(
         content=" ".join(pings) if pings else None,
         embed=warn_embed,
-        view=InaktivitaetsWarnView()
+        view=InaktivitätsWarnView()
     )
 
     data["ticket_channels"][ch_id_str]["inactivity_warned_at"] = get_now().isoformat()
@@ -623,7 +629,7 @@ def add_log_entry(action: str, user_id: int, details: dict):
     })
     save_data(data)
 
-def get_verfuegbares_guthaben(customer_id: str, versicherung: str) -> float:
+def get_verfügbares_guthaben(customer_id: str, versicherung: str) -> float:
     limit      = get_insurance_types().get(versicherung, {}).get("auszahlung_limit", 0.0)
     ausgezahlt = data['customers'].get(customer_id, {}).get("auszahlungen", {}).get(versicherung, 0.0)
     return max(0.0, limit - ausgezahlt)
@@ -674,14 +680,14 @@ def check_nachweis_duplicate(nachweis: str) -> Optional[dict]:
     return None
 
 def get_paid_invoice_count(customer_id: str) -> int:
-    """Anzahl der bezahlten Rechnungen eines Kunden (= Anzahl Monatsbeitraege)."""
+    """Anzahl der bezahlten Rechnungen eines Kunden (= Anzahl Monatsbeiträge)."""
     return sum(1 for inv in data["invoices"].values()
                if inv.get("customer_id") == customer_id and inv.get("paid", False))
 
 def can_cancel_insurance(customer_id: str) -> Tuple[bool, int]:
     """
-    Mindestlaufzeit: 4 bezahlte Rechnungen (4 Monatsbeitraege).
-    Returns (kuendigung_erlaubt, anzahl_bezahlter_rechnungen).
+    Mindestlaufzeit: 4 bezahlte Rechnungen (4 Monatsbeiträge).
+    Returns (kündigung_erlaubt, anzahl_bezahlter_rechnungen).
     """
     paid = get_paid_invoice_count(customer_id)
     return paid >= 4, paid
@@ -690,7 +696,7 @@ def can_cancel_insurance(customer_id: str) -> Tuple[bool, int]:
 async def customer_id_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> List[app_commands.Choice[str]]:
-    """Autocomplete fuer aktive Kunden-IDs (RP-Name + ID als Anzeige)."""
+    """Autocomplete für aktive Kunden-IDs (RP-Name + ID als Anzeige)."""
     q       = current.lower().strip()
     choices = []
     for cid, c in data["customers"].items():
@@ -706,7 +712,7 @@ async def customer_id_autocomplete(
 async def customer_id_all_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> List[app_commands.Choice[str]]:
-    """Autocomplete fuer alle Kunden-IDs (inkl. archivierte)."""
+    """Autocomplete für alle Kunden-IDs (inkl. archivierte)."""
     q       = current.lower().strip()
     choices = []
     for cid, c in data["customers"].items():
@@ -721,7 +727,7 @@ async def customer_id_all_autocomplete(
 async def invoice_id_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> List[app_commands.Choice[str]]:
-    """Autocomplete fuer Rechnungs-IDs."""
+    """Autocomplete für Rechnungs-IDs."""
     q       = current.lower().strip()
     choices = []
     for inv_id, inv in data["invoices"].items():
@@ -733,6 +739,45 @@ async def invoice_id_autocomplete(
         if len(choices) >= 25:
             break
     return choices
+
+# ── Blacklist-Helfer ──────────────────────────────────────────────────────────
+def is_blacklisted(customer_id: str) -> bool:
+    return customer_id in data.get("blacklist", {})
+
+def blacklist_entry(customer_id: str) -> Optional[dict]:
+    return data.get("blacklist", {}).get(customer_id)
+
+# ── DM-Erinnerungs-Helfer ────────────────────────────────────────────────────
+async def send_invoice_due_dm(guild: discord.Guild, invoice_id: str, inv: dict):
+    """Sendet dem Kunden eine DM 24h vor Rechnungsfälligkeit."""
+    customer = data["customers"].get(inv.get("customer_id", ""))
+    if not customer:
+        return
+    member = guild.get_member(customer.get("discord_user_id", 0))
+    if not member:
+        return
+    due = make_aware(datetime.fromisoformat(inv["due_date"])).strftime("%d.%m.%Y")
+    dm  = dvg_embed(
+        "Zahlungserinnerung",
+        f"> Ihre Versicherungsrechnung ist in **24 Stunden** fällig.\n"
+        f"> Bitte begleichen Sie den Betrag rechtzeitig, um eine Mahnung zu vermeiden."
+    )
+    dm.add_field(name="Rechnungsnummer", value=f"> `{invoice_id}`", inline=True)
+    dm.add_field(name="Betrag",          value=f"> `{inv.get('betrag',0):,.2f} EUR`", inline=True)
+    dm.add_field(name="Fällig am",      value=f"> `{due}`", inline=True)
+    dm.add_field(
+        name="Zahlungsmethoden",
+        value=f"> HBpay: `{customer.get('hbpay_nummer','—')}`\n"
+              f"> Economy-ID: `{customer.get('economy_id','—')}`",
+        inline=False
+    )
+    try:
+        await member.send(embed=dm)
+        data["invoices"][invoice_id]["dm_reminder_sent"] = True
+        save_data(data)
+        logger.info(f"Zahlungserinnerung per DM gesendet: {invoice_id} -> {member}")
+    except discord.Forbidden:
+        logger.warning(f"DM für {invoice_id} gesperrt ({member})")
 
 # ═══════════════════════════════════════════════════════
 #   BERECHTIGUNGSPRÜFUNGEN  (Bugfix: Tuple-Role-IDs)
@@ -873,7 +918,7 @@ IMMER_SICHTBAR = {"modul", "ping", "backup", "reload"}
 
 MODUL_COMMANDS = {
     "versicherung": {
-        "kunden-suchen", "versicherung-kuendigen", "rechnungen-uebersicht",
+        "kunden-suchen", "versicherung-kündigen", "rechnungen-Übersicht",
         "einstellung-steuer", "einstellung-versicherung-neu",
         "einstellung-versicherung-edit", "einstellung-versicherungen-liste",
         "einstellung-kanaele", "kundenakte-erstellen", "versicherung-hinzubuchen",
@@ -881,6 +926,7 @@ MODUL_COMMANDS = {
         "akte-archivieren", "auszahlung-einreichen", "akte-anzeigen",
         "statistiken", "logs-anzeigen", "add", "remove",
         "schaden-historie", "portal-zugang",
+        "blacklist-add", "blacklist-remove", "blacklist-liste",
     },
 }
 
@@ -949,7 +995,7 @@ async def on_ready():
     bot.add_view(TicketCloseView(0, ""))           # Legacy-Compat für bestehende Tickets
     bot.add_view(SchadensmeldungTicketView())      # Neue Schadensmeldungs-Tickets
     bot.add_view(KundenkontaktTicketView())        # Neue Kundenkontakt-Tickets
-    bot.add_view(InaktivitaetsWarnView())          # Inaktivitätswarnung
+    bot.add_view(InaktivitätsWarnView())          # Inaktivitätswarnung
     bot.add_view(AuszahlungActionView("dummy", "dummy", 0.0))
 
     # Verwaiste ticket_channels-Einträge bereinigen (Channel bereits gelöscht)
@@ -1176,7 +1222,7 @@ async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
 # ═══════════════════════════════════════════════════════
 #   VERSICHERUNG KÜNDIGEN
 # ═══════════════════════════════════════════════════════
-class KuendigungSelect(discord.ui.Select):
+class KündigungSelect(discord.ui.Select):
     def __init__(self, customer_id: str, customer: dict):
         self.customer_id = customer_id
         ins_types = get_insurance_types()
@@ -1184,7 +1230,7 @@ class KuendigungSelect(discord.ui.Select):
             discord.SelectOption(label=ins, description=f"Beitrag: {ins_types.get(ins,{}).get('price',0):,.2f} €/Mo", value=ins)
             for ins in customer.get("versicherungen", [])
         ]
-        super().__init__(placeholder="Zu kündigende Versicherung wählen...", min_values=1, max_values=len(options), options=options, custom_id="kuendigung_select")
+        super().__init__(placeholder="Zu kündigende Versicherung wählen...", min_values=1, max_values=len(options), options=options, custom_id="kündigung_select")
 
     async def callback(self, interaction: discord.Interaction):
         view = self.view
@@ -1200,11 +1246,11 @@ class KuendigungSelect(discord.ui.Select):
         e.set_footer(text="Diese Aktion kann nicht rückgängig gemacht werden • Copyright © InsuranceGuard v4", icon_url=FOOTER_ICON)
         await interaction.response.edit_message(embed=e, view=view)
 
-class KuendigungView(discord.ui.View):
+class KündigungView(discord.ui.View):
     def __init__(self, customer_id: str, customer: dict):
         super().__init__(timeout=120)
         self.confirmed = False
-        self._select   = KuendigungSelect(customer_id, customer)
+        self._select   = KündigungSelect(customer_id, customer)
         self.add_item(self._select)
         btn = discord.ui.Button(label="Kündigung bestätigen", style=discord.ButtonStyle.danger, disabled=True)
         btn.callback = self._confirm
@@ -1215,10 +1261,10 @@ class KuendigungView(discord.ui.View):
         await interaction.response.defer()
         self.stop()
 
-@bot.tree.command(name="versicherung-kuendigen", description="Kündigt eine oder mehrere Versicherungen eines Kunden")
+@bot.tree.command(name="versicherung-kündigen", description="Kündigt eine oder mehrere Versicherungen eines Kunden")
 @app_commands.describe(customer_id="Versicherungsnehmer-ID des Kunden")
 @app_commands.autocomplete(customer_id=customer_id_autocomplete)
-async def versicherung_kuendigen(interaction: discord.Interaction, customer_id: str):
+async def versicherung_kündigen(interaction: discord.Interaction, customer_id: str):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(embed=build_error_embed("Zugriff verweigert!", "Nur Mitarbeiter können Versicherungen kündigen.", "Mitarbeiter"), ephemeral=True)
         return
@@ -1230,25 +1276,25 @@ async def versicherung_kuendigen(interaction: discord.Interaction, customer_id: 
         await interaction.response.send_message(embed=dvg_embed("Keine Versicherungen!", "> Keine aktiven Versicherungen."), ephemeral=True)
         return
 
-    # ── Kündigungsfrist prüfen: mind. 4 bezahlte Rechnungen (4 Monatsbeitraege) ──
-    kuendigung_erlaubt, paid_count = can_cancel_insurance(customer_id)
-    if not kuendigung_erlaubt:
+    # ── Kündigungsfrist prüfen: mind. 4 bezahlte Rechnungen (4 Monatsbeiträge) ──
+    kündigung_erlaubt, paid_count = can_cancel_insurance(customer_id)
+    if not kündigung_erlaubt:
         fehlende = 4 - paid_count
         singular = fehlende == 1
         e = dvg_embed(
             "Kündigung nicht möglich — Mindestlaufzeit",
-            f"> Versicherungen können erst nach **4 geleisteten Monatsbeitraegen** gekündigt werden.\n"
+            f"> Versicherungen können erst nach **4 geleisteten Monatsbeiträgen** gekündigt werden.\n"
             f"> Diese Regelung schützt vor missbräuchlicher Nutzung des Versicherungsschutzes."
         )
         e.add_field(name="Bezahlte Rechnungen", value=f"> `{paid_count}` von `4` erforderlichen",                 inline=True)
-        e.add_field(name="Verbleibend",         value=f"> `{fehlende}` weiterer Monatsbeitrag" if singular else f"> `{fehlende}` weitere Monatsbeitraege", inline=True)
+        e.add_field(name="Verbleibend",         value=f"> `{fehlende}` weiterer Monatsbeitrag" if singular else f"> `{fehlende}` weitere Monatsbeiträge", inline=True)
         e.add_field(name="Versicherungsnehmer", value=f"> {customer['rp_name']} (`{customer_id}`)",               inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
         return
 
     ins_types = get_insurance_types()
     ins_text  = "\n".join(f">  {ins} — `{ins_types.get(ins,{}).get('price',0):,.2f} €/Mo`" for ins in customer.get('versicherungen',[]))
-    view = KuendigungView(customer_id, customer)
+    view = KündigungView(customer_id, customer)
     e = dvg_embed("Versicherung kündigen", "> Wählen Sie die zu kündigenden Versicherungen.")
     e.add_field(name="Versicherungsnehmer", value=f">  - {customer['rp_name']}\n>  - `{customer_id}`", inline=False)
     e.add_field(name="Aktive Versicherungen", value=ins_text or "> Keine", inline=False)
@@ -1330,9 +1376,9 @@ async def versicherung_kuendigen(interaction: discord.Interaction, customer_id: 
 # ═══════════════════════════════════════════════════════
 #   RECHNUNGEN-ÜBERSICHT
 # ═══════════════════════════════════════════════════════
-@bot.tree.command(name="rechnungen-uebersicht", description="Zeigt alle Rechnungen eines Kunden oder alle offenen Rechnungen")
+@bot.tree.command(name="rechnungen-Übersicht", description="Zeigt alle Rechnungen eines Kunden oder alle offenen Rechnungen")
 @app_commands.describe(customer_id="Versicherungsnehmer-ID (leer = alle offenen)", nur_offen="Nur offene Rechnungen anzeigen")
-async def rechnungen_uebersicht(interaction: discord.Interaction, customer_id: Optional[str] = None, nur_offen: bool = True):
+async def rechnungen_Übersicht(interaction: discord.Interaction, customer_id: Optional[str] = None, nur_offen: bool = True):
     if not is_leitungsebene(interaction):
         await interaction.response.send_message(embed=build_error_embed("Zugriff verweigert!", "Nur die Leitungsebene kann Rechnungsübersichten einsehen.", "Leitungsebene"), ephemeral=True)
         return
@@ -1692,11 +1738,24 @@ async def create_customer(interaction: discord.Interaction, forum_channel: disco
             kunden_role = await interaction.guild.create_role(name=KUNDEN_ROLE_NAME, color=discord.Color.from_rgb(52, 152, 219))
         await user.add_roles(kunden_role)
 
+        # ── Portal-Token automatisch erstellen und per DM senden ────────────────
+        token      = generate_portal_token(customer_id)
+        portal_url = f"{BOT_BASE_URL}/portal/{token}" if BOT_BASE_URL else None
+
         dm_embed = build_kundenakte_embed(customer_id, customer_data)
-        dm_embed.title = "Willkommen bei InsuranceGuard!"
+        dm_embed.title       = "Willkommen bei DVG InsuranceGuard!"
         dm_embed.description = "Ihre Versicherungsakte wurde erfolgreich angelegt."
+        if portal_url:
+            dm_embed.add_field(
+                name="Ihr Kundenportal",
+                value="> Ueber den Button unten gelangen Sie jederzeit zu Ihrer persoenlichen Versicherungsübersicht.",
+                inline=False
+            )
+        dm_view = discord.ui.View()
+        if portal_url:
+            dm_view.add_item(discord.ui.Button(label="Zum Kundenportal", url=portal_url))
         try:
-            dm_msg = await user.send(embed=dm_embed)
+            dm_msg = await user.send(embed=dm_embed, view=dm_view if portal_url else None)
             customer_data["dm_message_ids"] = [dm_msg.id]
         except discord.Forbidden:
             pass
@@ -2073,15 +2132,15 @@ class AuszahlungAntragsModal(discord.ui.Modal, title="Auszahlungsantrag"):
                 await interaction.followup.send(" Ungültiger Betrag.", ephemeral=True)
                 return
 
-            verfuegbar = get_verfuegbares_guthaben(self.customer_id, self.versicherung)
+            verfügbar = get_verfügbares_guthaben(self.customer_id, self.versicherung)
             ins_types  = get_insurance_types()
             limit      = ins_types.get(self.versicherung, {}).get("auszahlung_limit", 0.0)
 
             if betrag_float <= 0:
                 await interaction.followup.send(" Betrag muss > 0 sein.", ephemeral=True)
                 return
-            if betrag_float > verfuegbar:
-                await interaction.followup.send(f" Betrag überschreitet verfügbares Guthaben `{verfuegbar:,.2f} €`.", ephemeral=True)
+            if betrag_float > verfügbar:
+                await interaction.followup.send(f" Betrag überschreitet verfügbares Guthaben `{verfügbar:,.2f} €`.", ephemeral=True)
                 return
 
             az_channel_id = config.get("auszahlung_channel_id")
@@ -2101,7 +2160,7 @@ class AuszahlungAntragsModal(discord.ui.Modal, title="Auszahlungsantrag"):
             embed = dvg_embed("Auszahlungsantrag")
             embed.add_field(name="Antragsinformationen", value=f">  `{auszahlung_id}`\n>  `{betrag_float:,.2f} €`", inline=False)
             embed.add_field(name="Versicherungsnehmer", value=f">  {self.customer['rp_name']}\n>  `{self.customer_id}`", inline=False)
-            embed.add_field(name="Versicherung", value=f"> {self.versicherung}\n> - `{verfuegbar:,.2f} €` von `{limit:,.2f} €` verfügbar!", inline=False)
+            embed.add_field(name="Versicherung", value=f"> {self.versicherung}\n> - `{verfügbar:,.2f} €` von `{limit:,.2f} €` verfügbar!", inline=False)
             embed.add_field(name="Beschreibung", value=f"```{beschreibung_tx}```", inline=False)
             embed.add_field(name="Eingereicht von", value=f"{interaction.user.mention}", inline=True)
             embed.add_field(name="Status", value=">  Ausstehend", inline=True)
@@ -2135,10 +2194,10 @@ class AuszahlungSelectView(discord.ui.View):
         ins_types = get_insurance_types()
         options = []
         for versicherung in customer.get("versicherungen", []):
-            verfuegbar = get_verfuegbares_guthaben(customer_id, versicherung)
+            verfügbar = get_verfügbares_guthaben(customer_id, versicherung)
             limit      = ins_types.get(versicherung, {}).get("auszahlung_limit", 0.0)
-            bereits    = limit - verfuegbar
-            options.append(discord.SelectOption(label=versicherung[:100], description=f"Verfügbar: {verfuegbar:,.0f} € | Ausgezahlt: {bereits:,.0f} € / {limit:,.0f} €"[:100], value=versicherung if verfuegbar > 0 else ""))
+            bereits    = limit - verfügbar
+            options.append(discord.SelectOption(label=versicherung[:100], description=f"Verfügbar: {verfügbar:,.0f} € | Ausgezahlt: {bereits:,.0f} € / {limit:,.0f} €"[:100], value=versicherung if verfügbar > 0 else ""))
         self._select = discord.ui.Select(placeholder="Versicherung wählen...", min_values=1, max_values=1, options=options, custom_id="az_versicherung_select")
         self._select.callback = self._on_select
         self.add_item(self._select)
@@ -2146,13 +2205,13 @@ class AuszahlungSelectView(discord.ui.View):
 
     async def _on_select(self, interaction: discord.Interaction):
         selected   = self._select.values[0]
-        verfuegbar = get_verfuegbares_guthaben(self.customer_id, selected)
-        if verfuegbar <= 0:
+        verfügbar = get_verfügbares_guthaben(self.customer_id, selected)
+        if verfügbar <= 0:
             await interaction.response.send_message(f" Limit für `{selected}` ausgeschöpft.", ephemeral=True)
             return
         await interaction.response.send_modal(AuszahlungAntragsModal(self.customer_id, self._customer, selected))
 
-class AuszahlungBestaetigenModal(discord.ui.Modal, title="Auszahlung bestätigen – Nachweis"):
+class AuszahlungBestätigenModal(discord.ui.Modal, title="Auszahlung bestätigen – Nachweis"):
     auszahlungs_link = discord.ui.TextInput(label="Link der Auszahlungsnachricht", placeholder="https://discord.com/channels/...", required=True, max_length=500)
 
     def __init__(self, auszahlung_id: str, guild: discord.Guild, confirmer: discord.Member):
@@ -2175,15 +2234,15 @@ class AuszahlungBestaetigenModal(discord.ui.Modal, title="Auszahlung bestätigen
             if not customer:
                 await interaction.followup.send(" Kunde nicht gefunden.", ephemeral=True)
                 return
-            verfuegbar = get_verfuegbares_guthaben(customer_id, versicherung)
-            if betrag > verfuegbar:
-                await interaction.followup.send(f" Guthaben reicht nicht aus (`{verfuegbar:,.2f} €` verfügbar).", ephemeral=True)
+            verfügbar = get_verfügbares_guthaben(customer_id, versicherung)
+            if betrag > verfügbar:
+                await interaction.followup.send(f" Guthaben reicht nicht aus (`{verfügbar:,.2f} €` verfügbar).", ephemeral=True)
                 return
 
             if "auszahlungen" not in data['customers'][customer_id]:
                 data['customers'][customer_id]["auszahlungen"] = {}
             data['customers'][customer_id]["auszahlungen"][versicherung] = data['customers'][customer_id]["auszahlungen"].get(versicherung, 0.0) + betrag
-            data["pending_auszahlungen"][self.auszahlung_id].update({"status": "bestaetigt", "bestaetigt_von": self.confirmer.id, "bestaetigt_am": get_now().isoformat(), "auszahlungs_link": self.auszahlungs_link.value})
+            data["pending_auszahlungen"][self.auszahlung_id].update({"status": "bestätigt", "bestätigt_von": self.confirmer.id, "bestätigt_am": get_now().isoformat(), "auszahlungs_link": self.auszahlungs_link.value})
             save_data(data)
 
             thread_id = customer.get("thread_id")
@@ -2191,10 +2250,10 @@ class AuszahlungBestaetigenModal(discord.ui.Modal, title="Auszahlung bestätigen
                 try:
                     thread = self.guild.get_thread(thread_id) or await self.guild.fetch_channel(thread_id)
                     if thread:
-                        neues_guthaben = get_verfuegbares_guthaben(customer_id, versicherung)
+                        neues_guthaben = get_verfügbares_guthaben(customer_id, versicherung)
                         ve = dvg_embed("Auszahlungsvermerk")
                         ve.add_field(name="Antrags-ID", value=f"> `{self.auszahlung_id}`\n> Versicherung: `{versicherung}`\n> [Zur Auszahlungsnachricht]({self.auszahlungs_link.value})", inline=False)
-                        ve.add_field(name="Details", value=f"> Verfügbar vorher: `{verfuegbar:,.2f} €`\n> Ausgezahlt: `-{betrag:,.2f} €`\n> **Restguthaben: `{neues_guthaben:,.2f} €`**", inline=False)
+                        ve.add_field(name="Details", value=f"> Verfügbar vorher: `{verfügbar:,.2f} €`\n> Ausgezahlt: `-{betrag:,.2f} €`\n> **Restguthaben: `{neues_guthaben:,.2f} €`**", inline=False)
                         ve.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
                         await thread.send(embed=ve)
                 except Exception as ex:
@@ -2242,8 +2301,8 @@ class AuszahlungActionView(discord.ui.View):
                     return az_id
         return self.auszahlung_id
 
-    @discord.ui.button(label="Bestätigen", style=discord.ButtonStyle.green, custom_id="auszahlung_bestaetigen")
-    async def bestaetigen(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Bestätigen", style=discord.ButtonStyle.green, custom_id="auszahlung_bestätigen")
+    async def bestätigen(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_firmenkontorolle(interaction):
             await interaction.response.send_message(embed=build_error_embed("Zugriff verweigert!", "Nur das Firmenkonto kann Auszahlungsanträge bearbeiten.", "Firmenkonto"), ephemeral=True)
             return
@@ -2252,7 +2311,7 @@ class AuszahlungActionView(discord.ui.View):
         if not pending or pending.get("status") != "ausstehend":
             await interaction.response.send_message(" Bereits bearbeitet oder nicht gefunden.", ephemeral=True)
             return
-        await interaction.response.send_modal(AuszahlungBestaetigenModal(az_id, interaction.guild, interaction.user))
+        await interaction.response.send_modal(AuszahlungBestätigenModal(az_id, interaction.guild, interaction.user))
 
     @discord.ui.button(label="Abbrechen", style=discord.ButtonStyle.danger, custom_id="auszahlung_abbrechen")
     async def abbrechen(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2297,9 +2356,9 @@ async def auszahlung_einreichen(interaction: discord.Interaction, customer_id: s
     ins_types   = get_insurance_types()
     limits_text = ""
     for versicherung in customer.get("versicherungen", []):
-        verfuegbar = get_verfuegbares_guthaben(customer_id, versicherung)
+        verfügbar = get_verfügbares_guthaben(customer_id, versicherung)
         limit      = ins_types.get(versicherung, {}).get("auszahlung_limit", 0.0)
-        limits_text += f"**{versicherung}**\n> Verfügbar: `{verfuegbar:,.2f} EUR` von `{limit:,.2f} EUR`\n"
+        limits_text += f"**{versicherung}**\n> Verfügbar: `{verfügbar:,.2f} EUR` von `{limit:,.2f} EUR`\n"
     e = dvg_embed("Auszahlungsantrag einreichen", f"> Versicherungsnehmer: **{customer['rp_name']}** (`{customer_id}`)")
     e.add_field(name="Auszahlungsguthaben", value=limits_text or "> Keine Daten", inline=False)
     await interaction.response.send_message(embed=e, view=AuszahlungSelectView(customer_id, customer), ephemeral=True)
@@ -2327,7 +2386,7 @@ class SchadensmeldungView(discord.ui.View):
 # ═══════════════════════════════════════════════════════
 #   INAKTIVITÄTS-WARNUNG VIEW
 # ═══════════════════════════════════════════════════════
-class InaktivitaetsWarnView(discord.ui.View):
+class InaktivitätsWarnView(discord.ui.View):
     """Persistent View für die 16h-Inaktivitätswarnung."""
 
     def __init__(self):
@@ -2362,7 +2421,7 @@ class InaktivitaetsWarnView(discord.ui.View):
         save_data(data)
 
         button.disabled = True
-        button.label    = "Schliessen abgebrochen"
+        button.label    = "Schließen abgebrochen"
         await interaction.response.edit_message(view=self)
 
         confirm = discord.Embed(
@@ -2469,7 +2528,7 @@ class SchadensmeldungTicketView(discord.ui.View):
             await interaction.channel.send(embed=release_embed)
             add_log_entry("TICKET_FREIGEGEBEN", interaction.user.id, {"channel_id": interaction.channel.id})
 
-    @discord.ui.button(label="Ticket schliessen", style=discord.ButtonStyle.danger,
+    @discord.ui.button(label="Ticket schließen", style=discord.ButtonStyle.danger,
                        custom_id="sd_close_ticket")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_mitarbeiter(interaction):
@@ -2489,7 +2548,7 @@ class KundenkontaktTicketView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Ticket schliessen", style=discord.ButtonStyle.danger,
+    @discord.ui.button(label="Ticket schließen", style=discord.ButtonStyle.danger,
                        custom_id="kk_close_ticket")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_mitarbeiter(interaction):
@@ -2664,8 +2723,8 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
 # ═══════════════════════════════════════════════════════
 class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen"):
     customer_id_input = discord.ui.TextInput(label="Versicherungsnehmer-ID", placeholder="VN-24123456", required=True, max_length=20)
-    geschaedigter     = discord.ui.TextInput(label="Geschädigter (RP-Name)", placeholder="Max Mustermann", required=True, max_length=100)
-    taeter            = discord.ui.TextInput(label="Täter (RP-Name)", placeholder="John Doe", required=True, max_length=100)
+    Geschädigter     = discord.ui.TextInput(label="Geschädigter (RP-Name)", placeholder="Max Mustermann", required=True, max_length=100)
+    Täter            = discord.ui.TextInput(label="Täter (RP-Name)", placeholder="John Doe", required=True, max_length=100)
     beschreibung      = discord.ui.TextInput(label="Beschreibung des Vorfalls", style=discord.TextStyle.paragraph, placeholder="Bitte beschreiben Sie den Vorfall so detailliert wie möglich...", required=True, max_length=1000)
     rechnung          = discord.ui.TextInput(label="Rechnung/Zahlungsnachweis", placeholder="Rechnungsnummer oder Link", required=True, max_length=200)
 
@@ -2677,6 +2736,22 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
                 await interaction.followup.send(embed=build_error_embed("Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."), ephemeral=True)
                 return
             customer = data['customers'][customer_id]
+
+            # ── Blacklist-Check ──
+            bl = blacklist_entry(customer_id)
+            if bl:
+                added = make_aware(datetime.fromisoformat(bl["added_at"])).strftime("%d.%m.%Y")
+                bl_e  = dvg_embed(
+                    "Einreichung abgelehnt",
+                    "> Für diesen Versicherungsnehmer koennen keine Schadensmeldungen eingereicht werden.\n"
+                    "> Bitte wende dich an die Leitungsebene für weitere Informationen."
+                )
+                bl_e.add_field(name="Kunden-ID", value=f"> `{customer_id}`", inline=True)
+                bl_e.add_field(name="Gesperrt seit", value=f"> `{added}`", inline=True)
+                await interaction.followup.send(embed=bl_e, ephemeral=True)
+                add_log_entry("BLACKLIST_BLOCK", interaction.user.id,
+                              {"customer_id": customer_id, "grund": bl.get("grund","")})
+                return
 
             # ── Duplikat-Check: ein Ticket pro Kunde ──
             existing = customer_has_active_ticket(customer_id, "schadensmeldung")
@@ -2747,7 +2822,7 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
             )
             embed.add_field(
                 name="Beteiligte Personen",
-                value=f"> Geschädigter: **{self.geschaedigter.value}**\n> Täter: **{self.taeter.value}**",
+                value=f"> Geschädigter: **{self.Geschädigter.value}**\n> Täter: **{self.Täter.value}**",
                 inline=False
             )
             embed.add_field(name="Vorfallbeschreibung", value=f"```{self.beschreibung.value}```", inline=False)
@@ -2784,8 +2859,8 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
             data.setdefault("schaden_historie", {}).setdefault(customer_id, []).append({
                 "id":           schaden_id,
                 "datum":        jetzt,
-                "geschaedigter": self.geschaedigter.value,
-                "taeter":       self.taeter.value,
+                "Geschädigter": self.Geschädigter.value,
+                "Täter":       self.Täter.value,
                 "nachweis":     nachweis_val,
                 "beschreibung": self.beschreibung.value[:500],
                 "status":       "offen",
@@ -2801,7 +2876,7 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
             await send_to_dokumentation_channel(
                 guild, interaction.user,
                 vorgang=ticket_channel.mention,
-                anliegen=f"Schadensmeldung — Geschädigter: {self.geschaedigter.value} | Täter: {self.taeter.value}"
+                anliegen=f"Schadensmeldung — Geschädigter: {self.Geschädigter.value} | Täter: {self.Täter.value}"
             )
 
             s = dvg_embed("Schadensmeldung eingereicht", f"> Ticket: {ticket_channel.mention}")
@@ -2951,7 +3026,7 @@ async def show_stats(interaction: discord.Interaction):
     off_re     = sum(1 for inv in invoices.values() if not inv.get('paid'))
     bez_re     = sum(1 for inv in invoices.values() if inv.get('paid'))
     aus_pend   = sum(1 for az in pending_az.values() if az.get('status') == 'ausstehend')
-    aus_best   = sum(1 for az in pending_az.values() if az.get('status') == 'bestaetigt')
+    aus_best   = sum(1 for az in pending_az.values() if az.get('status') == 'bestätigt')
     offene_sm  = sum(1 for t in tickets.values() if t.get('type') == 'schadensmeldung')
     offene_kk  = sum(1 for t in tickets.values() if t.get('type') == 'kundenkontakt')
     claimed    = sum(1 for t in tickets.values() if t.get('claimed_by') is not None)
@@ -3027,8 +3102,8 @@ async def cmd_schaden_historie(interaction: discord.Interaction, customer_id: st
                 name=f"`{entry.get('id','—')}` — {datum}",
                 value=(
                     f"> Status: {status}\n"
-                    f"> Geschädigter: **{entry.get('geschaedigter','—')}**\n"
-                    f"> Täter: **{entry.get('taeter','—')}**\n"
+                    f"> Geschädigter: **{entry.get('Geschädigter','—')}**\n"
+                    f"> Täter: **{entry.get('Täter','—')}**\n"
                     f"> Nachweis: `{entry.get('nachweis','—')[:60]}`"
                     + closed_dt
                 ),
@@ -3036,7 +3111,7 @@ async def cmd_schaden_historie(interaction: discord.Interaction, customer_id: st
             )
 
     if len(history) > 10:
-        e.add_field(name="Hinweis", value=f"> Zeige die letzten 10 von {len(history)} Eintraegen.", inline=False)
+        e.add_field(name="Hinweis", value=f"> Zeige die letzten 10 von {len(history)} Einträgen.", inline=False)
 
     await interaction.response.send_message(embed=e, ephemeral=True)
 
@@ -3063,7 +3138,7 @@ async def cmd_portal_zugang(interaction: discord.Interaction, customer_id: str):
     customer = data["customers"][customer_id]
     if customer.get("status") == "archiviert":
         await interaction.response.send_message(
-            embed=build_error_embed("Akte archiviert!", "Fuer archivierte Kunden kann kein Portal-Zugang ausgestellt werden."),
+            embed=build_error_embed("Akte archiviert!", "Für archivierte Kunden kann kein Portal-Zugang ausgestellt werden."),
             ephemeral=True
         )
         return
@@ -3078,7 +3153,7 @@ async def cmd_portal_zugang(interaction: discord.Interaction, customer_id: str):
         dm_embed = dvg_embed(
             "Ihr DVG Kundenportal-Zugang",
             "> Ihr persoenlicher Zugangscode wurde erstellt.\n"
-            "> Ueber den Button unten gelangen Sie direkt zu Ihrer Versicherungsubersicht."
+            "> Ueber den Button unten gelangen Sie direkt zu Ihrer Versicherungsübersicht."
         )
         dm_embed.add_field(name="Versicherungsnehmer", value=f"> {customer['rp_name']}", inline=True)
         dm_embed.add_field(name="Kunden-ID",           value=f"> `{customer_id}`",        inline=True)
@@ -3099,7 +3174,7 @@ async def cmd_portal_zugang(interaction: discord.Interaction, customer_id: str):
 
     result = dvg_embed(
         "Portal-Zugang ausgestellt",
-        f"> Zugangscode fuer **{customer['rp_name']}** generiert."
+        f"> Zugangscode für **{customer['rp_name']}** generiert."
     )
     result.add_field(name="Kunden-ID",    value=f"> `{customer_id}`",  inline=True)
     result.add_field(name="DM gesendet",  value=f"> {'Ja' if dm_ok else 'Nein (DMs gesperrt)'}",  inline=True)
@@ -3117,6 +3192,105 @@ async def cmd_portal_zugang(interaction: discord.Interaction, customer_id: str):
     await interaction.followup.send(embed=result, ephemeral=True)
 
 # ═══════════════════════════════════════════════════════
+#   BLACKLIST
+# ═══════════════════════════════════════════════════════
+@bot.tree.command(name="blacklist-add", description="[LE] Sperrt einen Kunden von Schadensmeldungen")
+@app_commands.describe(customer_id="Versicherungsnehmer-ID", grund="Grund für die Sperrung")
+@app_commands.autocomplete(customer_id=customer_id_autocomplete)
+async def cmd_blacklist_add(interaction: discord.Interaction, customer_id: str, grund: str):
+    if not is_leitungsebene(interaction):
+        await interaction.response.send_message(
+            embed=build_error_embed("Zugriff verweigert!", "Nur die Leitungsebene.", "Leitungsebene"),
+            ephemeral=True
+        )
+        return
+    if customer_id not in data["customers"]:
+        await interaction.response.send_message(
+            embed=build_error_embed("Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."),
+            ephemeral=True
+        )
+        return
+    if is_blacklisted(customer_id):
+        await interaction.response.send_message(
+            embed=dvg_embed("Bereits gesperrt", f"> Kunden-ID `{customer_id}` ist bereits auf der Blacklist."),
+            ephemeral=True
+        )
+        return
+
+    data["blacklist"][customer_id] = {
+        "grund":    grund,
+        "added_by": interaction.user.id,
+        "added_at": get_now().isoformat()
+    }
+    save_data(data)
+
+    customer = data["customers"][customer_id]
+    e = dvg_embed("Kunde zur Blacklist hinzugefuegt",
+                  f"> **{customer['rp_name']}** (`{customer_id}`) wurde gesperrt.")
+    e.add_field(name="Grund",       value=f"> {grund}",                  inline=False)
+    e.add_field(name="Gesperrt von", value=f"> {interaction.user.mention}", inline=True)
+    e.add_field(name="Datum",        value=f"> `{get_now().strftime('%d.%m.%Y %H:%M')}`", inline=True)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+    await send_to_log_channel(interaction.guild, e)
+    add_log_entry("BLACKLIST_ADD", interaction.user.id, {"customer_id": customer_id, "grund": grund})
+
+@bot.tree.command(name="blacklist-remove", description="[LE] Hebt die Sperrung eines Kunden auf")
+@app_commands.describe(customer_id="Versicherungsnehmer-ID")
+@app_commands.autocomplete(customer_id=customer_id_all_autocomplete)
+async def cmd_blacklist_remove(interaction: discord.Interaction, customer_id: str):
+    if not is_leitungsebene(interaction):
+        await interaction.response.send_message(
+            embed=build_error_embed("Zugriff verweigert!", "Nur die Leitungsebene.", "Leitungsebene"),
+            ephemeral=True
+        )
+        return
+    if not is_blacklisted(customer_id):
+        await interaction.response.send_message(
+            embed=dvg_embed("Nicht gesperrt", f"> `{customer_id}` ist nicht auf der Blacklist."),
+            ephemeral=True
+        )
+        return
+
+    entry    = data["blacklist"].pop(customer_id)
+    save_data(data)
+    customer = data["customers"].get(customer_id, {})
+    e = dvg_embed("Sperrung aufgehoben",
+                  f"> **{customer.get('rp_name', customer_id)}** (`{customer_id}`) wurde entsperrt.")
+    e.add_field(name="Ursprünglicher Grund", value=f"> {entry.get('grund','—')}", inline=False)
+    e.add_field(name="Aufgehoben von",        value=f"> {interaction.user.mention}", inline=True)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+    await send_to_log_channel(interaction.guild, e)
+    add_log_entry("BLACKLIST_REMOVE", interaction.user.id, {"customer_id": customer_id})
+
+@bot.tree.command(name="blacklist-liste", description="Zeigt alle gesperrten Kunden")
+async def cmd_blacklist_liste(interaction: discord.Interaction):
+    if not is_mitarbeiter(interaction):
+        await interaction.response.send_message(
+            embed=build_error_embed("Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"),
+            ephemeral=True
+        )
+        return
+    bl = data.get("blacklist", {})
+    e  = dvg_embed("Blacklist", f"> {len(bl)} gesperrte Kunden")
+    if not bl:
+        e.add_field(name="Einträge", value="> Keine Kunden gesperrt.", inline=False)
+    else:
+        for cid, entry in list(bl.items())[:20]:
+            cust   = data["customers"].get(cid, {})
+            added  = make_aware(datetime.fromisoformat(entry["added_at"])).strftime("%d.%m.%Y") \
+                     if entry.get("added_at") else "—"
+            adder  = interaction.guild.get_member(entry.get("added_by", 0))
+            e.add_field(
+                name=f"{cust.get('rp_name','Unbekannt')} — `{cid}`",
+                value=(
+                    f"> Grund: {entry.get('grund','—')}\n"
+                    f"> Gesperrt: `{added}` von {adder.mention if adder else '—'}"
+                ),
+                inline=False
+            )
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+# ═══════════════════════════════════════════════════════
 #   AUTOMATISCHE TASKS
 # ═══════════════════════════════════════════════════════
 @tasks.loop(hours=24)
@@ -3130,9 +3304,19 @@ async def check_invoices():
                 due_date = make_aware(datetime.fromisoformat(inv['due_date']))
             except Exception:
                 continue
-            days_overdue  = (now - due_date).days
+
+            days_until = (due_date - now).days   # negativ = überfällig
+            days_overdue = (now - due_date).days
+
+            # ── DM-Erinnerung 24h vor Fälligkeit ────────────────────────────
+            if days_until == 1 and not inv.get('dm_reminder_sent', False):
+                for guild in bot.guilds:
+                    await send_invoice_due_dm(guild, invoice_id, inv)
+                    break
+
             if days_overdue < 0:
                 continue
+
             rc = inv.get('reminder_count', 0)
             if days_overdue == 0 and rc == 0:
                 await send_reminder(invoice_id, inv, 1, 0)
@@ -3348,68 +3532,463 @@ def get_customer_by_token(token: str):
 #   KUNDEN-PORTAL — CSS
 # ═══════════════════════════════════════════════════════
 _PORTAL_CSS = """
-:root{--blue:#3D4EC5;--red:#B82238;--bg:#0b0f1e;--card:#131929;--card2:#1a2240;
-  --border:#232d50;--text:#e8eaf6;--muted:#8892b0;--green:#22c55e;--amber:#f59e0b;}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;
-  font-size:15px;line-height:1.5;min-height:100vh}
-a{color:var(--blue);text-decoration:none}
-.topbar{background:var(--card);border-bottom:1px solid var(--border);padding:14px 24px;
-  display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:20}
-.logo{font-size:18px;font-weight:800;letter-spacing:-.5px}
-.logo span{color:var(--blue)}
-.topbar-meta{font-size:12px;color:var(--muted)}
-.container{max-width:960px;margin:0 auto;padding:24px 16px}
-.section-title{font-size:12px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
-  color:var(--muted);margin-bottom:12px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:20px;margin-bottom:16px}
-.card-title{font-size:16px;font-weight:700;margin-bottom:4px}
-.card-sub{font-size:13px;color:var(--muted)}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-.stat{background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:16px}
-.stat-val{font-size:24px;font-weight:800;color:var(--text)}
-.stat-lbl{font-size:11px;color:var(--muted);margin-top:2px;text-transform:uppercase;letter-spacing:.8px}
-.tab-bar{display:flex;gap:4px;border-bottom:1px solid var(--border);margin:24px 0 20px;flex-wrap:wrap}
-.tab{padding:10px 18px;font-size:14px;font-weight:600;color:var(--muted);cursor:pointer;
-  border-bottom:2px solid transparent;border:none;background:none;color:var(--muted)}
-.tab.active,.tab:hover{color:var(--text);border-bottom:2px solid var(--blue)}
-.tab-panel{display:none}.tab-panel.active{display:block}
-.ins-card{background:var(--card2);border:1px solid var(--border);border-radius:8px;
-  padding:16px;margin-bottom:12px}
-.ins-name{font-weight:700;margin-bottom:10px;font-size:15px}
-.progress-wrap{background:#0b0f1e;border-radius:999px;height:8px;overflow:hidden;margin:6px 0}
-.progress-bar{height:100%;border-radius:999px;
-  background:linear-gradient(90deg,var(--blue),#7c8ef0);transition:width .4s}
-.progress-bar.full{background:linear-gradient(90deg,var(--red),#e06070)}
-.progress-labels{display:flex;justify-content:space-between;font-size:12px;color:var(--muted)}
-table{width:100%;border-collapse:collapse;font-size:14px}
-thead th{text-align:left;font-size:11px;font-weight:700;letter-spacing:1px;
-  text-transform:uppercase;color:var(--muted);padding:8px 12px;
-  border-bottom:1px solid var(--border)}
-tbody tr{border-bottom:1px solid var(--border)}
-tbody tr:hover{background:var(--card2)}
-td{padding:10px 12px;color:var(--text)}
-.badge{display:inline-block;padding:2px 8px;border-radius:999px;
-  font-size:11px;font-weight:700;letter-spacing:.3px}
-.badge-green{background:#16301a;color:var(--green)}
-.badge-amber{background:#2a2007;color:var(--amber)}
-.badge-red{background:#2a0a0a;color:#f87171}
-.hero{background:linear-gradient(135deg,#131929 0%,#1a2550 100%);
-  border:1px solid var(--border);border-radius:12px;padding:28px;
-  margin-bottom:24px;display:flex;align-items:center;gap:20px}
-.hero-avatar{width:56px;height:56px;border-radius:12px;background:var(--blue);
-  display:flex;align-items:center;justify-content:center;
-  font-size:22px;font-weight:800;flex-shrink:0;color:#fff}
-.hero-name{font-size:22px;font-weight:800}
-.hero-id{font-size:13px;color:var(--muted);margin-top:2px}
-.empty{text-align:center;padding:40px;color:var(--muted);font-size:14px}
-footer{text-align:center;color:var(--muted);font-size:12px;
-  padding:32px 16px;border-top:1px solid var(--border);margin-top:32px}
-@media(max-width:600px){
-  .grid2,.grid3{grid-template-columns:1fr}
-  .hero{flex-direction:column;align-items:flex-start}
-  .tab{padding:8px 12px;font-size:13px}
+/* ── Reset & Tokens ──────────────────────────────────── */
+:root {
+  --blue:        #3D4EC5;
+  --blue-light:  #5a6de8;
+  --blue-dim:    #1e255c;
+  --red:         #B82238;
+  --bg:          #080c1a;
+  --bg2:         #0d1225;
+  --surface:     #111827;
+  --surface2:    #161f35;
+  --border:      #1e2d52;
+  --border-light:#283660;
+  --text:        #e8eaf6;
+  --text-dim:    #a8b0cc;
+  --muted:       #5a6585;
+  --green:       #34d399;
+  --green-dim:   #0d2e22;
+  --amber:       #fbbf24;
+  --amber-dim:   #2d1f06;
+  --red-bright:  #f87171;
+  --red-dim:     #2d0a0a;
+  --radius:      12px;
+  --radius-sm:   8px;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+  min-height: 100vh;
+}
+a { color: var(--blue-light); text-decoration: none; }
+
+/* ── Layout ─────────────────────────────────────────── */
+.layout { display: flex; min-height: 100vh; }
+
+/* ── Sidebar ─────────────────────────────────────────── */
+.sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  background: var(--bg2);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+.sidebar-logo {
+  padding: 24px 20px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.sidebar-logo .wordmark {
+  font-size: 20px;
+  font-weight: 900;
+  letter-spacing: -0.5px;
+  color: var(--text);
+}
+.sidebar-logo .wordmark span { color: var(--blue-light); }
+.sidebar-logo .tagline {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 3px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.sidebar-nav { padding: 12px 10px; flex: 1; }
+.nav-section {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 12px 10px 6px;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all .15s;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+}
+.nav-item:hover { background: var(--surface); color: var(--text); }
+.nav-item.active {
+  background: var(--blue-dim);
+  color: var(--blue-light);
+  font-weight: 600;
+}
+.nav-icon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  opacity: .7;
+}
+.nav-item.active .nav-icon { opacity: 1; }
+.nav-badge {
+  margin-left: auto;
+  background: var(--blue-dim);
+  color: var(--blue-light);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 99px;
+}
+.nav-badge.red { background: var(--red-dim); color: var(--red-bright); }
+.sidebar-footer {
+  padding: 16px 20px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+/* ── Main Content ────────────────────────────────────── */
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.topbar {
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  padding: 14px 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  backdrop-filter: blur(10px);
+}
+.topbar-left { font-size: 16px; font-weight: 700; }
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.topbar-time { font-size: 12px; color: var(--muted); }
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 6px var(--green);
+  flex-shrink: 0;
+}
+.content { padding: 28px; max-width: 900px; }
+
+/* ── Tab panels ──────────────────────────────────────── */
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* ── Page header ─────────────────────────────────────── */
+.page-header {
+  margin-bottom: 24px;
+}
+.page-title { font-size: 22px; font-weight: 800; }
+.page-sub { font-size: 13px; color: var(--muted); margin-top: 3px; }
+
+/* ── Hero card ───────────────────────────────────────── */
+.hero {
+  background: linear-gradient(135deg, #111827 0%, #151f3a 60%, #1a2550 100%);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  padding: 24px;
+  margin-bottom: 20px;
+  position: relative;
+  overflow: hidden;
+}
+.hero::before {
+  content: '';
+  position: absolute;
+  top: -60px; right: -60px;
+  width: 200px; height: 200px;
+  background: radial-gradient(circle, rgba(61,78,197,.25) 0%, transparent 70%);
+  pointer-events: none;
+}
+.hero-inner { display: flex; align-items: center; gap: 18px; }
+.hero-avatar {
+  width: 60px; height: 60px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, var(--blue), #7c8ef0);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px; font-weight: 900; color: #fff;
+  flex-shrink: 0;
+  box-shadow: 0 4px 20px rgba(61,78,197,.4);
+}
+.hero-name { font-size: 20px; font-weight: 800; }
+.hero-meta {
+  display: flex;
+  gap: 16px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.hero-meta-item { font-size: 12px; color: var(--text-dim); }
+.hero-meta-item code {
+  background: var(--surface2);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--blue-light);
+}
+.hero-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(52,211,153,.1);
+  border: 1px solid rgba(52,211,153,.25);
+  color: var(--green);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 99px;
+  margin-top: 8px;
+}
+
+/* ── Stat cards ──────────────────────────────────────── */
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+  position: relative;
+  overflow: hidden;
+}
+.stat-card::after {
+  content: '';
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, var(--blue), transparent);
+}
+.stat-val {
+  font-size: 26px;
+  font-weight: 900;
+  line-height: 1;
+  margin-bottom: 6px;
+}
+.stat-lbl {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.stat-trend {
+  font-size: 12px;
+  color: var(--green);
+  margin-top: 4px;
+}
+
+/* ── Section ─────────────────────────────────────────── */
+.section { margin-bottom: 28px; }
+.section-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 14px;
+}
+
+/* ── Data card ───────────────────────────────────────── */
+.data-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+.data-card-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.data-card-title {
+  font-size: 15px;
+  font-weight: 700;
+}
+.data-card-body { padding: 20px; }
+.data-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+.data-field-lbl {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .8px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+.data-field-val {
+  font-size: 16px;
+  font-weight: 700;
+}
+.data-field-val code {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 14px;
+  color: var(--blue-light);
+  font-weight: 600;
+}
+
+/* ── Insurance card ──────────────────────────────────── */
+.ins-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: 12px;
+  transition: border-color .2s;
+}
+.ins-card:hover { border-color: var(--border-light); }
+.ins-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+.ins-name { font-size: 15px; font-weight: 700; }
+.ins-price { font-size: 13px; color: var(--text-dim); margin-top: 2px; }
+.ins-limit-badge {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+.progress-track {
+  height: 6px;
+  background: var(--bg);
+  border-radius: 99px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, var(--blue), var(--blue-light));
+  transition: width 1s cubic-bezier(.4,0,.2,1);
+}
+.progress-fill.warn  { background: linear-gradient(90deg, var(--amber), #f59e0b); }
+.progress-fill.full  { background: linear-gradient(90deg, var(--red), #f87171); }
+.progress-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.progress-labels strong { color: var(--text); }
+
+/* ── Table ───────────────────────────────────────────── */
+.table-wrap {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+thead th {
+  text-align: left;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 12px 16px;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+}
+tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
+tbody tr:last-child { border-bottom: none; }
+tbody tr:hover { background: var(--surface2); }
+td { padding: 12px 16px; color: var(--text); vertical-align: middle; }
+td code {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 12px;
+  color: var(--blue-light);
+}
+
+/* ── Badges ──────────────────────────────────────────── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border-radius: 99px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .3px;
+  white-space: nowrap;
+}
+.badge-green  { background: var(--green-dim);  color: var(--green); }
+.badge-amber  { background: var(--amber-dim);  color: var(--amber); }
+.badge-red    { background: var(--red-dim);    color: var(--red-bright); }
+.badge-blue   { background: var(--blue-dim);   color: var(--blue-light); }
+.badge-dot {
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* ── Empty state ─────────────────────────────────────── */
+.empty {
+  text-align: center;
+  padding: 48px 24px;
+  color: var(--muted);
+  font-size: 14px;
+}
+.empty-icon {
+  font-size: 32px;
+  margin-bottom: 12px;
+  opacity: .4;
+}
+
+/* ── Responsive ──────────────────────────────────────── */
+@media (max-width: 768px) {
+  .sidebar { display: none; }
+  .stats-row { grid-template-columns: 1fr 1fr; }
+  .data-grid { grid-template-columns: 1fr; }
+  .content { padding: 16px; }
+  .hero-inner { flex-direction: column; align-items: flex-start; }
+}
+@media (max-width: 480px) {
+  .stats-row { grid-template-columns: 1fr; }
 }
 """
 
@@ -3449,65 +4028,61 @@ def build_portal_dashboard(customer_id: str, customer: dict, token: str) -> str:
     invoices     = sorted(
         [(iid, inv) for iid, inv in data["invoices"].items()
          if inv.get("customer_id") == customer_id],
-        key=lambda x: x[1].get("created_at",""), reverse=True
+        key=lambda x: x[1].get("created_at", ""), reverse=True
     )
-    schaden      = sorted(
+    schaden = sorted(
         data.get("schaden_historie", {}).get(customer_id, []),
-        key=lambda x: x.get("datum",""), reverse=True
+        key=lambda x: x.get("datum", ""), reverse=True
     )
-    initials = "".join(w[0].upper() for w in customer.get("rp_name","?").split()[:2])
+    initials = "".join(w[0].upper() for w in customer.get("rp_name", "?").split()[:2])
 
-    total_limit = sum(ins_types.get(i,{}).get("auszahlung_limit",0.0) for i in vers)
-    total_paid  = sum(auszahlungen.get(i,0.0) for i in vers)
-    open_inv    = sum(1 for _,inv in invoices if not inv.get("paid"))
+    total_limit = sum(ins_types.get(i, {}).get("auszahlung_limit", 0.0) for i in vers)
+    total_paid  = sum(auszahlungen.get(i, 0.0) for i in vers)
+    total_avail = max(0.0, total_limit - total_paid)
+    pct_used    = min(100, int(total_paid / total_limit * 100)) if total_limit > 0 else 0
+    open_inv    = sum(1 for _, inv in invoices if not inv.get("paid"))
     since       = make_aware(datetime.fromisoformat(customer["created_at"])).strftime("%d.%m.%Y") \
                   if customer.get("created_at") else "—"
 
-    # Stats row
-    stats = f"""<div class="grid3" style="margin-bottom:24px">
-      <div class="stat">
-        <div class="stat-val">{len(vers)}</div>
-        <div class="stat-lbl">Versicherungen</div>
-      </div>
-      <div class="stat">
-        <div class="stat-val">{customer.get('total_monthly_price',0):,.0f} EUR</div>
-        <div class="stat-lbl">Monatsbeitrag</div>
-      </div>
-      <div class="stat">
-        <div class="stat-val">{open_inv}</div>
-        <div class="stat-lbl">Offene Rechnungen</div>
-      </div>
-    </div>"""
+    # Pre-compute conditional HTML fragments (avoid complex f-string nesting)
+    inv_badge_cls     = "nav-badge red" if open_inv > 0 else "nav-badge"
+    open_inv_style    = 'style="color:var(--amber)"' if open_inv > 0 else ''
+    pct_bar_cls       = "progress-fill warn" if pct_used >= 60 else "progress-fill"
 
-    # Insurance cards
-    if not vers:
-        ins_html = '<div class="empty">Keine aktiven Versicherungen.</div>'
-    else:
-        ins_html = ""
-        for ins in vers:
-            limit      = ins_types.get(ins,{}).get("auszahlung_limit", 0.0)
-            price      = ins_types.get(ins,{}).get("price", 0.0)
-            ausgezahlt = auszahlungen.get(ins, 0.0)
-            verfuegbar = max(0.0, limit - ausgezahlt)
-            pct        = min(100, int(ausgezahlt / limit * 100)) if limit > 0 else 0
-            bar_cls    = "progress-bar full" if pct >= 90 else "progress-bar"
-            ins_html += f"""<div class="ins-card">
+    # ── Insurance cards ───────────────────────────────────────────────────────
+    ins_html = ""
+    for ins in vers:
+        limit      = ins_types.get(ins, {}).get("auszahlung_limit", 0.0)
+        price      = ins_types.get(ins, {}).get("price", 0.0)
+        ausgezahlt = auszahlungen.get(ins, 0.0)
+        verfügbar = max(0.0, limit - ausgezahlt)
+        pct        = min(100, int(ausgezahlt / limit * 100)) if limit > 0 else 0
+        bar_cls    = "progress-fill full" if pct >= 90 else ("progress-fill warn" if pct >= 60 else "progress-fill")
+        avail_style = 'style="color:var(--red-bright)"' if pct >= 90 else ""
+        ins_html += f"""
+        <div class="ins-card">
+          <div class="ins-header">
+            <div>
               <div class="ins-name">{_esc(ins)}</div>
-              <div class="progress-wrap">
-                <div class="{bar_cls}" style="width:{pct}%"></div>
-              </div>
-              <div class="progress-labels">
-                <span>Ausgezahlt: <strong>{ausgezahlt:,.2f} EUR</strong></span>
-                <span>Verfuegbar: <strong>{verfuegbar:,.2f} EUR</strong></span>
-              </div>
-              <div style="margin-top:8px;font-size:12px;color:var(--muted)">
-                Monatsbeitrag: {price:,.2f} EUR &nbsp;&middot;&nbsp; Limit: {limit:,.2f} EUR
-              </div>
-            </div>"""
+              <div class="ins-price">{price:,.2f} EUR / Monat</div>
+            </div>
+            <div class="ins-limit-badge">Limit: {limit:,.0f} EUR</div>
+          </div>
+          <div class="progress-track">
+            <div class="{bar_cls}" style="width:{pct}%"></div>
+          </div>
+          <div class="progress-labels">
+            <span>Ausgezahlt: <strong>{ausgezahlt:,.2f} EUR</strong></span>
+            <span {avail_style}>Verfügbar: <strong>{verfügbar:,.2f} EUR</strong></span>
+          </div>
+        </div>"""
 
-    # Invoice table
+    if not ins_html:
+        ins_html = '<div class="empty"><div class="empty-icon">*</div>Keine aktiven Versicherungen.</div>'
+
+    # ── Invoice table ─────────────────────────────────────────────────────────
     if not invoices:
-        inv_html = '<div class="empty">Keine Rechnungen vorhanden.</div>'
+        inv_html = '<div class="empty"><div class="empty-icon">-</div>Keine Rechnungen vorhanden.</div>'
     else:
         rows = ""
         for iid, inv in invoices[:25]:
@@ -3515,33 +4090,29 @@ def build_portal_dashboard(customer_id: str, customer: dict, token: str) -> str:
                 due_dt = make_aware(datetime.fromisoformat(inv["due_date"]))
                 due    = due_dt.strftime("%d.%m.%Y")
             except Exception:
-                due    = "—"
                 due_dt = get_now()
+                due    = "—"
             if inv.get("paid"):
-                badge = '<span class="badge badge-green">Bezahlt</span>'
+                badge = '<span class="badge badge-green"><span class="badge-dot"></span>Bezahlt</span>'
             elif due_dt < get_now():
-                badge = '<span class="badge badge-red">Ueberfaellig</span>'
+                badge = '<span class="badge badge-red"><span class="badge-dot"></span>Ueberfällig</span>'
             else:
-                badge = '<span class="badge badge-amber">Ausstehend</span>'
+                badge = '<span class="badge badge-amber"><span class="badge-dot"></span>Ausstehend</span>'
             mahn = inv.get("reminder_count", 0)
             mahn_tx = f' <span class="badge badge-red">Mahnstufe {mahn}</span>' if mahn > 0 else ""
             rows += f"""<tr>
-              <td><code style="font-size:13px">{_esc(iid)}</code></td>
-              <td>{inv.get('betrag',0):,.2f} EUR</td>
+              <td><code>{_esc(iid)}</code></td>
+              <td style="font-weight:700">{inv.get("betrag", 0):,.2f} EUR</td>
               <td>{due}</td>
               <td>{badge}{mahn_tx}</td>
             </tr>"""
-        inv_html = f"""<table>
-          <thead><tr>
-            <th>Rechnungsnr.</th><th>Betrag</th>
-            <th>Faellig</th><th>Status</th>
-          </tr></thead>
-          <tbody>{rows}</tbody>
-        </table>"""
+        inv_html = f'''<div class="table-wrap"><table>
+          <thead><tr><th>Rechnungsnr.</th><th>Betrag</th><th>Fällig am</th><th>Status</th></tr></thead>
+          <tbody>{rows}</tbody></table></div>'''
 
-    # Damage history table
+    # ── Damage history ────────────────────────────────────────────────────────
     if not schaden:
-        sch_html = '<div class="empty">Keine Schadensmeldungen vorhanden.</div>'
+        sch_html = '<div class="empty"><div class="empty-icon">-</div>Keine Schadensmeldungen vorhanden.</div>'
     else:
         rows = ""
         for entry in schaden[:15]:
@@ -3549,120 +4120,207 @@ def build_portal_dashboard(customer_id: str, customer: dict, token: str) -> str:
                 datum = make_aware(datetime.fromisoformat(entry["datum"])).strftime("%d.%m.%Y")
             except Exception:
                 datum = "—"
-            badge = '<span class="badge badge-green">Abgeschlossen</span>' \
+            badge = '<span class="badge badge-green"><span class="badge-dot"></span>Abgeschlossen</span>' \
                     if entry.get("status") == "abgeschlossen" \
-                    else '<span class="badge badge-amber">In Bearbeitung</span>'
+                    else '<span class="badge badge-amber"><span class="badge-dot"></span>In Bearbeitung</span>'
             rows += f"""<tr>
-              <td><code style="font-size:13px">{_esc(entry.get('id','—'))}</code></td>
+              <td><code>{_esc(entry.get("id", "—"))}</code></td>
               <td>{datum}</td>
-              <td>{_esc(entry.get('geschaedigter','—'))}</td>
-              <td>{_esc(entry.get('taeter','—'))}</td>
+              <td>{_esc(entry.get("Geschädigter", "—"))}</td>
+              <td>{_esc(entry.get("Täter", "—"))}</td>
               <td>{badge}</td>
             </tr>"""
-        sch_html = f"""<table>
-          <thead><tr>
-            <th>Vorgang-Nr.</th><th>Datum</th>
-            <th>Geschaedigter</th><th>Taeter</th><th>Status</th>
-          </tr></thead>
-          <tbody>{rows}</tbody>
-        </table>"""
+        sch_html = f'''<div class="table-wrap"><table>
+          <thead><tr><th>Vorgang-Nr.</th><th>Datum</th><th>Geschädigter</th><th>Täter</th><th>Status</th></tr></thead>
+          <tbody>{rows}</tbody></table></div>'''
 
     return f"""<!DOCTYPE html>
 <html lang="de">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DVG Kundenportal &ndash; {_esc(customer['rp_name'])}</title>
+<title>DVG Kundenportal &ndash; {_esc(customer["rp_name"])}</title>
 <style>{_PORTAL_CSS}</style>
 </head>
 <body>
-<div class="topbar">
-  <div class="logo">D<span>V</span>G Kundenportal</div>
-  <div class="topbar-meta">Stand: {get_now().strftime("%d.%m.%Y %H:%M")} Uhr</div>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <div class="wordmark">D<span>V</span>G</div>
+      <div class="tagline">Kundenportal</div>
+    </div>
+    <nav class="sidebar-nav">
+      <div class="nav-section">Navigation</div>
+      <button class="nav-item active" onclick="showTab('Übersicht',this)">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+          <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+        </svg>Übersicht
+      </button>
+      <button class="nav-item" onclick="showTab('vers',this)">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        </svg>Versicherungen<span class="nav-badge">{len(vers)}</span>
+      </button>
+      <button class="nav-item" onclick="showTab('inv',this)">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+        </svg>Rechnungen
+        <span class="{inv_badge_cls}">{len(invoices)}</span>
+      </button>
+      <button class="nav-item" onclick="showTab('sch',this)">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>Schadenhistorie<span class="nav-badge">{len(schaden)}</span>
+      </button>
+    </nav>
+    <div class="sidebar-footer">
+      InsuranceGuard v4<br>Copyright &copy; DVG<br>
+      Stand: {get_now().strftime("%d.%m.%Y %H:%M")} Uhr
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-left">Guten Tag, {_esc(customer["rp_name"].split()[0])}</div>
+      <div class="topbar-right">
+        <div class="status-dot"></div>
+        <span class="topbar-time">{get_now().strftime("%d.%m.%Y %H:%M")} Uhr</span>
+      </div>
+    </header>
+
+    <div class="content">
+
+      <div id="tab-Übersicht" class="tab-panel active">
+        <div class="hero">
+          <div class="hero-inner">
+            <div class="hero-avatar">{_esc(initials)}</div>
+            <div>
+              <div class="hero-name">{_esc(customer["rp_name"])}</div>
+              <div class="hero-meta">
+                <span class="hero-meta-item">ID: <code>{_esc(customer_id)}</code></span>
+                <span class="hero-meta-item">Kunde seit: <code>{since}</code></span>
+                <span class="hero-meta-item">HBpay: <code>{_esc(customer.get("hbpay_nummer","—"))}</code></span>
+              </div>
+              <div class="hero-badge">
+                <span class="badge-dot"></span> Aktiver Versicherungsnehmer
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat-card">
+            <div class="stat-val">{len(vers)}</div>
+            <div class="stat-lbl">Versicherungen</div>
+            <div class="stat-trend">Alle aktiv</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val">{customer.get("total_monthly_price",0):,.0f} EUR</div>
+            <div class="stat-lbl">Monatsbeitrag</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" {open_inv_style}>
+              {open_inv}
+            </div>
+            <div class="stat-lbl">Offene Rechnungen</div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-label">Zahlungsdaten</div>
+          <div class="data-card">
+            <div class="data-card-body">
+              <div class="data-grid">
+                <div>
+                  <div class="data-field-lbl">HBpay Kontonummer</div>
+                  <div class="data-field-val"><code>{_esc(customer.get("hbpay_nummer","—"))}</code></div>
+                </div>
+                <div>
+                  <div class="data-field-lbl">Economy-ID</div>
+                  <div class="data-field-val"><code>{_esc(customer.get("economy_id","—"))}</code></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-label">Gesamtes Auszahlungslimit</div>
+          <div class="data-card">
+            <div class="data-card-body">
+              <div class="data-grid">
+                <div>
+                  <div class="data-field-lbl">Limit gesamt</div>
+                  <div class="data-field-val">{total_limit:,.2f} EUR</div>
+                </div>
+                <div>
+                  <div class="data-field-lbl">Bereits ausgezahlt</div>
+                  <div class="data-field-val">{total_paid:,.2f} EUR</div>
+                </div>
+              </div>
+              <div style="margin-top:20px">
+                <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:8px">
+                  <span>Verbrauchtes Limit</span><span>{pct_used} %</span>
+                </div>
+                <div class="progress-track" style="height:8px">
+                  <div class="progress-fill" style="width:{pct_used}%"></div>
+                </div>
+                <div style="font-size:12px;color:var(--muted);margin-top:6px">
+                  {total_avail:,.2f} EUR verbleibend
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="tab-vers" class="tab-panel">
+        <div class="page-header">
+          <div class="page-title">Versicherungen</div>
+          <div class="page-sub">{len(vers)} aktive{"r" if len(vers)==1 else ""} Versicherungsvertrag{"" if len(vers)==1 else "e"}</div>
+        </div>
+        {ins_html}
+      </div>
+
+      <div id="tab-inv" class="tab-panel">
+        <div class="page-header">
+          <div class="page-title">Rechnungen</div>
+          <div class="page-sub">{len(invoices)} Rechnungen — {open_inv} offen</div>
+        </div>
+        {inv_html}
+      </div>
+
+      <div id="tab-sch" class="tab-panel">
+        <div class="page-header">
+          <div class="page-title">Schadenhistorie</div>
+          <div class="page-sub">{len(schaden)} Schadensmeldung{"" if len(schaden)==1 else "en"}</div>
+        </div>
+        {sch_html}
+      </div>
+
+    </div>
+  </div>
 </div>
-<div class="container">
-  <div class="hero">
-    <div class="hero-avatar">{_esc(initials)}</div>
-    <div>
-      <div class="hero-name">{_esc(customer['rp_name'])}</div>
-      <div class="hero-id">
-        Kunden-ID: <code>{_esc(customer_id)}</code>
-        &nbsp;&middot;&nbsp; Kunde seit: {since}
-      </div>
-    </div>
-  </div>
 
-  {stats}
-
-  <div class="tab-bar">
-    <button class="tab active" onclick="showTab('uebersicht',this)">Uebersicht</button>
-    <button class="tab" onclick="showTab('vers',this)">Versicherungen ({len(vers)})</button>
-    <button class="tab" onclick="showTab('inv',this)">Rechnungen ({len(invoices)})</button>
-    <button class="tab" onclick="showTab('sch',this)">Schadenhistorie ({len(schaden)})</button>
-  </div>
-
-  <div id="tab-uebersicht" class="tab-panel active">
-    <div class="section-title">Zahlungsdaten</div>
-    <div class="card">
-      <div class="grid2">
-        <div>
-          <div class="card-sub">HBpay Kontonummer</div>
-          <div style="font-size:17px;font-weight:700;margin-top:4px">
-            <code>{_esc(customer.get('hbpay_nummer','—'))}</code>
-          </div>
-        </div>
-        <div>
-          <div class="card-sub">Economy-ID</div>
-          <div style="font-size:17px;font-weight:700;margin-top:4px">
-            <code>{_esc(customer.get('economy_id','—'))}</code>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="section-title">Auszahlungsuebersicht</div>
-    <div class="card">
-      <div class="grid2">
-        <div>
-          <div class="card-sub">Gesamtes Auszahlungslimit</div>
-          <div style="font-size:20px;font-weight:700;margin-top:4px">
-            {total_limit:,.2f} EUR
-          </div>
-        </div>
-        <div>
-          <div class="card-sub">Bereits ausgezahlt</div>
-          <div style="font-size:20px;font-weight:700;margin-top:4px">
-            {total_paid:,.2f} EUR
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div id="tab-vers" class="tab-panel">
-    <div class="section-title">Aktive Versicherungen</div>
-    {ins_html}
-  </div>
-
-  <div id="tab-inv" class="tab-panel">
-    <div class="section-title">Rechnungshistorie</div>
-    {inv_html}
-  </div>
-
-  <div id="tab-sch" class="tab-panel">
-    <div class="section-title">Schadensmeldungen</div>
-    {sch_html}
-  </div>
-</div>
-<footer>InsuranceGuard v4 &nbsp;&middot;&nbsp; Copyright &copy; DVG &nbsp;&middot;&nbsp; Kundenportal</footer>
 <script>
 function showTab(id,el){{
   document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(b=>b.classList.remove('active'));
   document.getElementById('tab-'+id).classList.add('active');
   el.classList.add('active');
 }}
+window.addEventListener('load',()=>{{
+  document.querySelectorAll('.progress-fill').forEach(b=>{{
+    const w=b.style.width;b.style.width='0%';
+    setTimeout(()=>{{b.style.width=w;}},120);
+  }});
+}});
 </script>
 </body></html>"""
+
 
 # ═══════════════════════════════════════════════════════
 #   KUNDEN-PORTAL — Flask-Routen
@@ -3679,7 +4337,7 @@ def portal_landing():
 <body>
 <div class="card">
   <div class="logo">D<span>V</span>G</div>
-  <div class="sub">Kundenportal &ndash; Ihre Versicherungsubersicht</div>
+  <div class="sub">Kundenportal &ndash; Ihre Versicherungsübersicht</div>
   {err}
   <form method="POST" action="/portal/login">
     <label>Zugangscode</label>
