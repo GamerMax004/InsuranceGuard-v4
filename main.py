@@ -1062,8 +1062,8 @@ IMMER_SICHTBAR = {"modul", "ping", "backup", "reload"}
 MODUL_COMMANDS = {
     "versicherung": {
         "kunden-suchen",
-        "versicherung-kündigen",
-        "rechnungen-Übersicht",
+        "versicherung-kuendigen",
+        "rechnungen-uebersicht",
         "einstellung-steuer",
         "einstellung-versicherung-neu",
         "einstellung-versicherung-edit",
@@ -1536,7 +1536,7 @@ class KündigungView(discord.ui.View):
 
 
 @bot.tree.command(
-    name="versicherung-kündigen",
+    name="versicherung-kuendigen",
     description="Kündigt eine oder mehrere Versicherungen eines Kunden",
 )
 @app_commands.describe(customer_id="Versicherungsnehmer-ID des Kunden")
@@ -1760,7 +1760,7 @@ async def versicherung_kündigen(interaction: discord.Interaction, customer_id: 
 #   RECHNUNGEN-ÜBERSICHT
 # ═══════════════════════════════════════════════════════
 @bot.tree.command(
-    name="rechnungen-Übersicht",
+    name="rechnungen-uebersicht",
     description="Zeigt alle Rechnungen eines Kunden oder alle offenen Rechnungen",
 )
 @app_commands.describe(
