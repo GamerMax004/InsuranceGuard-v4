@@ -107,12 +107,6 @@ DEFAULT_CONFIG = {
             "auszahlung_limit": 10000.00,
             "enabled": True,
         },
-        "Berufsunfähigkeitsversicherung": {
-            "price": 10000.00,
-            "role": "Berufsunfähigkeitsversicherung",
-            "auszahlung_limit": 20000.00,
-            "enabled": True,
-        },
         "Bußgeldversicherung": {
             "price": 10000.00,
             "role": "Bußgeldversicherung",
@@ -226,12 +220,14 @@ def generate_auszahlung_id() -> str:
 #  (#2B2D31 Dark Mode) → der farbige Streifen links ist optisch nicht sichtbar.
 #  Alle visuellen Unterschiede kommen aus Titel, Beschreibung und Struktur.
 EMBED_COLOR = 0x393A41
-EMBED_ERROR = 0xC03A2B
-EMBED_WARNING = 0xE67E22
-EMBED_SUCCESS = 0x27AE5F
 
 # Legacy-Aliase (werden intern nicht mehr direkt genutzt, aber falls externe
 # Referenzen bestehen bleiben sie vorhanden)
+EMBED_SUCCESS = 0x27AE5F
+EMBED_WARNING = 0xE67E22
+EMBED_ERROR = 0xC03A2B
+
+# Legacy-Aliase
 COLOR_PRIMARY = EMBED_COLOR
 COLOR_SUCCESS = EMBED_SUCCESS
 COLOR_WARNING = EMBED_WARNING
@@ -239,6 +235,11 @@ COLOR_ERROR = EMBED_ERROR
 COLOR_INFO = EMBED_COLOR
 COLOR_DAMAGE = EMBED_COLOR
 COLOR_CLAIM = EMBED_COLOR
+
+# DVG-Akzentfarben
+DVG_BLUE = 0x3D4EC5
+DVG_RED = 0xB82238
+DVG_PURPLE = 0x5A3D8A
 
 # DVG-Akzentfarben (für spätere Nutzung in Visualisierungen)
 DVG_BLUE = 0x3D4EC5
@@ -254,7 +255,7 @@ KUNDEN_ROLE_NAME = "Versicherungsnehmer"
 FOOTER_ICON = "https://media.discordapp.net/attachments/1473692441726029874/1497915098310901861/IGv4.png?ex=69ef41a5&is=69edf025&hm=1840dd2e17a7eff7b28600d3ac2f4e3bc658ff0fb8f53f73e16292760088d87e&=&format=webp&quality=lossless&width=625&height=625"
 AUTOMOD_ICON = "https://media.discordapp.net/attachments/1473692441726029874/1473692787156455474/1072-automod.png?ex=699722dc&is=6995d15c&hm=08ad340d3673e1f1076cbf73d235ea3b0e8ef10b07abb8d24ea66d85c6b59edb&=&format=webp&quality=lossless&width=250&height=250"
 FOOTER_TEXT = "Copyright © InsuranceGuard v4"
-AUTHOR_NAME = ""
+AUTHOR_NAME = "DVG InsuranceGuard"
 
 
 # ═══════════════════════════════════════════════════════
@@ -549,6 +550,8 @@ async def close_ticket_channel(
                 entry["closed_at"] = get_now().isoformat()
                 entry["closed_by"] = closer_id
                 break
+        # Panel-Bearbeitungszeit direkt nach Abschluss aktualisieren
+        asyncio.create_task(_do_panel_refresh())
 
     # ── Close-Embed ──────────────────────────────────────────────────────────
     title_text = (
@@ -792,7 +795,7 @@ def can_cancel_insurance(customer_id: str) -> Tuple[bool, int]:
     return paid >= 4, paid
 
 
-# ── Autocomplete-Funktionen ─────────────────────────n��────────────────────────
+# ── Autocomplete-Funktionen ──────────────────────────────────────────────────
 async def customer_id_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> List[app_commands.Choice[str]]:
@@ -1057,7 +1060,7 @@ async def update_customer_thread_backup(guild: discord.Guild, customer_id: str):
 # ═══════════════════════════════════════════════════════
 #   MODUL-SYSTEM
 # ═══════════════════════════════════════════════════════
-IMMER_SICHTBAR = {"modul", "ping", "backup", "reload"}
+IMMER_SICHTBAR = {"server", "ping", "backup", "reload", "panel-aktualisieren"}
 
 MODUL_COMMANDS = {
     "versicherung": {
@@ -1188,6 +1191,10 @@ async def on_ready():
     if not refresh_schadensmeldung_panel.is_running():
         refresh_schadensmeldung_panel.start()
 
+    # Panel einmalig beim Start aktualisieren (bestehende Daten sofort anwenden)
+    await asyncio.sleep(2)
+    await _do_panel_refresh()
+
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -1248,7 +1255,7 @@ async def ping(interaction: discord.Interaction):
 #   /modul
 # ═══════════════════════════════════════════════════════
 @bot.tree.command(
-    name="modul", description="[ADMIN] Versicherungsmodul aktivieren oder deaktivieren"
+    name="server", description="[ADMIN] Versicherungsmodul aktivieren oder deaktivieren"
 )
 @app_commands.describe(aktion="Modul aktivieren oder deaktivieren")
 @app_commands.choices(
@@ -1509,7 +1516,7 @@ class KündigungSelect(discord.ui.Select):
             inline=False,
         )
         e.set_footer(
-            text="Diese Aktion kann nicht rückgängig gemacht werden • Copyright © InsuranceGuard v4",
+            text=f"Diese Aktion kann nicht rückgängig gemacht werden • {FOOTER_TEXT}",
             icon_url=FOOTER_ICON,
         )
         await interaction.response.edit_message(embed=e, view=view)
@@ -4867,6 +4874,41 @@ async def cmd_portal_zugang(interaction: discord.Interaction, customer_id: str):
 
 
 # ═══════════════════════════════════════════════════════
+#   PANEL-AKTUALISIEREN (manueller Trigger)
+# ═══════════════════════════════════════════════════════
+@bot.tree.command(
+    name="panel-aktualisieren",
+    description="[Admin] Aktualisiert die Bearbeitungszeit im Schadensmeldungs-Panel sofort",
+)
+async def cmd_panel_aktualisieren(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            embed=build_error_embed(
+                "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
+            ),
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok = await _do_panel_refresh()
+    if ok:
+        e = dvg_embed(
+            "Panel aktualisiert",
+            "> Die Bearbeitungszeit im Schadensmeldungs-Panel wurde erfolgreich aktualisiert.",
+        )
+    else:
+        e = dvg_embed(
+            "Panel nicht gefunden",
+            "> Das Panel konnte nicht aktualisiert werden.\n"
+            "> Mögliche Ursachen:\n"
+            "> - Kein Panel-Kanal konfiguriert (`/einstellung-kanaele`)\n"
+            "> - Die Bot-Nachricht wurde gelöscht oder ist nicht mehr auffindbar\n"
+            "> - Bitte Panel neu posten mit `/einstellung-kanaele`",
+        )
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
+# ═══════════════════════════════════════════════════════
 #   BLACKLIST
 # ═══════════════════════════════════════════════════════
 @bot.tree.command(
@@ -5088,62 +5130,78 @@ async def auto_backup():
         logger.error(f"Auto-Backup Fehler: {ex}", exc_info=True)
 
 
-@tasks.loop(hours=12)
+@tasks.loop(hours=6)
 async def refresh_schadensmeldung_panel():
     """
-    Aktualisiert die Bearbeitungszeit im Schadensmeldungs-Panel alle 12 Stunden.
-    Bearbeitet die neueste Panel-Nachricht im konfigurierten Kanal.
+    Aktualisiert die Bearbeitungszeit im Schadensmeldungs-Panel alle 6 Stunden.
+    Erstellt das Feld wenn es noch nicht im Panel vorhanden ist.
+    """
+    await _do_panel_refresh()
+
+
+async def _do_panel_refresh() -> bool:
+    """
+    Kernlogik für den Panel-Refresh — separat aufrufbar (Command + Task).
+    Gibt True zurück wenn das Panel erfolgreich aktualisiert wurde.
     """
     try:
         sm_ch_id = config.get("schadensmeldung_channel_id")
         if not sm_ch_id:
-            return
+            return False
 
         sm_stats = [
             s
             for s in data.get("ticket_stats", [])
             if s.get("type") == "schadensmeldung" and s.get("duration_minutes")
         ]
-        if not sm_stats:
-            return  # Noch keine Daten — kein Update nötig
 
-        avg_m = int(sum(s["duration_minutes"] for s in sm_stats) / len(sm_stats))
-        h, m = divmod(avg_m, 60)
-        avg_tx = f"`{h}h {m}min`" if h else f"`{m} Minuten`"
-        bearbzeit = (
-            f"> Voraussichtliche Bearbeitungszeit: {avg_tx}\n"
-            f"> Basierend auf {len(sm_stats)} abgeschlossenen Vorgängen."
-        )
+        if sm_stats:
+            avg_m = int(sum(s["duration_minutes"] for s in sm_stats) / len(sm_stats))
+            h, m = divmod(avg_m, 60)
+            avg_tx = f"`{h}h {m}min`" if h else f"`{m} Minuten`"
+            bearbzeit = (
+                f"> Voraussichtliche Bearbeitungszeit: {avg_tx}\n"
+                f"> Basierend auf {len(sm_stats)} abgeschlossenen Vorgängen."
+            )
+        else:
+            bearbzeit = "> Voraussichtliche Bearbeitungszeit: **wird nach ersten Vorgängen ermittelt**"
 
         for guild in bot.guilds:
             ch = guild.get_channel(sm_ch_id)
             if not ch:
                 continue
-            # Letzte Bot-Nachricht im Panel-Kanal finden und Embed aktualisieren
-            async for msg in ch.history(limit=20):
-                if msg.author.id == bot.user.id and msg.embeds:
-                    emb = msg.embeds[0]
-                    # Bearbeitungszeit-Feld aktualisieren
-                    new_fields = []
-                    updated = False
-                    for field in emb.fields:
-                        if field.name == "Bearbeitungszeit":
-                            new_fields.append(("Bearbeitungszeit", bearbzeit, False))
-                            updated = True
-                        else:
-                            new_fields.append((field.name, field.value, field.inline))
-                    if updated:
-                        emb.clear_fields()
-                        for name, value, inline in new_fields:
-                            emb.add_field(name=name, value=value, inline=inline)
-                        await msg.edit(embed=emb)
-                        logger.info(
-                            "Schadensmeldungs-Panel Bearbeitungszeit aktualisiert."
-                        )
-                    break
+            async for msg in ch.history(limit=30):
+                if msg.author.id != bot.user.id or not msg.embeds:
+                    continue
+                emb = msg.embeds[0]
+
+                # Prüfen ob das Feld bereits existiert
+                feld_existiert = any(f.name == "Bearbeitungszeit" for f in emb.fields)
+
+                new_fields = []
+                for field in emb.fields:
+                    if field.name == "Bearbeitungszeit":
+                        new_fields.append(("Bearbeitungszeit", bearbzeit, False))
+                    else:
+                        new_fields.append((field.name, field.value, field.inline))
+
+                # Feld nicht vorhanden → ans Ende anhängen
+                if not feld_existiert:
+                    new_fields.append(("Bearbeitungszeit", bearbzeit, False))
+
+                emb.clear_fields()
+                for name, value, inline in new_fields:
+                    emb.add_field(name=name, value=value, inline=inline)
+
+                await msg.edit(embed=emb)
+                logger.info(
+                    f"Panel aktualisiert — {len(sm_stats)} Vorgänge, Ø {bearbzeit[:60]}"
+                )
+                return True
             break
     except Exception as ex:
         logger.error(f"Panel-Refresh Fehler: {ex}", exc_info=True)
+    return False
 
 
 # ═══════════════════════════════════════════════════════
