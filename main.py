@@ -880,10 +880,10 @@ async def send_invoice_due_dm(guild: discord.Guild, invoice_id: str, inv: dict):
     )
     dm.add_field(name="Fällig am", value=f"> `{due}`", inline=True)
     dm.add_field(
-        name="Zahlungsmethoden",
-        value=f"> HBpay: `{customer.get('hbpay_nummer', '—')}`\n"
-        f"> Economy-ID: `{customer.get('economy_id', '—')}`",
-        inline=False)
+        name="Zahlungsmethode",
+        value=f"> HBpay: `{customer.get('hbpay_nummer', '—')}`",
+        inline=False,
+    )
     dm.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
     try:
         await member.send(embed=dm)
@@ -962,8 +962,8 @@ def build_kundenakte_embed(customer_id: str, customer: dict) -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="Zahlungsmethoden",
-        value=f"> `-` `{customer['hbpay_nummer']}`\n> `-` `{customer['economy_id']}`",
+        name="Zahlungsmethode",
+        value=f"> `-` `{customer['hbpay_nummer']}`",
         inline=False,
     )
     ins_text = "\n".join(
@@ -971,7 +971,9 @@ def build_kundenakte_embed(customer_id: str, customer: dict) -> discord.Embed:
         for ins in customer.get("versicherungen", [])
     )
     embed.add_field(
-        name="Abgeschlossene Versicherungen", value=ins_text or "> *Keine Versicherungen abgeschlossen!*", inline=False
+        name="Abgeschlossene Versicherungen",
+        value=ins_text or "> *Keine Versicherungen abgeschlossen!*",
+        inline=False,
     )
     embed.add_field(
         name="Gesamtbeitrag (monatlich)",
@@ -998,7 +1000,11 @@ async def update_forum_thread_embed(
                 msg.author.id == (guild.me.id if guild.me else bot.user.id)
                 and msg.embeds
             ):
-                await msg.edit(embed=build_kundenakte_embed(customer_id, customer))
+                uid = customer.get("discord_user_id")
+                ping = f"<@{uid}>" if uid else ""
+                await msg.edit(
+                    content=ping, embed=build_kundenakte_embed(customer_id, customer)
+                )
                 return
     except Exception as e:
         logger.error(f"Forum-Thread Update Fehler: {e}")
@@ -1165,6 +1171,9 @@ async def on_ready():
     bot.add_view(TicketCloseView(0, ""))  # Legacy-Compat für bestehende Tickets
     bot.add_view(SchadensmeldungTicketView())  # Neue Schadensmeldungs-Tickets
     bot.add_view(KundenkontaktTicketView())  # Neue Kundenkontakt-Tickets
+    bot.add_view(
+        CloseRequestView()
+    )  # Schließanfrage: Annehmen/Ablehnen durch den Kunden
     bot.add_view(InaktivitätsWarnView())  # Inaktivitätswarnung
     bot.add_view(AuszahlungActionView("dummy", "dummy", 0.0))
 
@@ -1396,7 +1405,7 @@ async def reload_backup(interaction: discord.Interaction, datei: discord.Attachm
     name="kunden-suchen",
     description="Sucht nach Kunden anhand des RP-Namens oder der Kunden-ID",
 )
-@app_commands.describe(suchbegriff="RP-Name, Kunden-ID, Kartennummer oder Economy-ID")
+@app_commands.describe(suchbegriff="RP-Name, Kunden-ID oder Kartennummer")
 async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
@@ -1417,7 +1426,6 @@ async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
             if q in cid.lower()
             or q in c.get("rp_name", "").lower()
             or q in c.get("hbpay_nummer", "").lower()
-            or q in c.get("economy_id", "").lower()
         ]
         if not treffer:
             embed = discord.Embed(
@@ -1428,7 +1436,7 @@ async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
             )
             embed.add_field(
                 name="Suchtipps",
-                value="> `-` Kunden-ID: `VN-26123456`\n> `-` RP-Name: `Max Mustermann`\n> `-` Kartennummer oder Economy-ID",
+                value="> `-` Kunden-ID: `VN-26123456`\n> `-` RP-Name: `Max Mustermann`\n> `-` Kartennummer",
                 inline=False,
             )
             embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
@@ -1453,12 +1461,15 @@ async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
                 value=(
                     f"> `-` `{cid}`\n"
                     f"> `-` `{c['hbpay_nummer']}`\n"
-                    f"> `-` `{c['economy_id']}`\n"
                     f"> `-` {status_text}\n"
                     f"> `-` `{c.get('total_monthly_price', 0):,.2f} €/Monat`\n"
                     + versicherungen[:200]
                     + "\n"
-                    + (f"> `-` <#{thread_id}>" if thread_id else ">  - *Keine Akte gefunden!*")
+                    + (
+                        f"> `-` <#{thread_id}>"
+                        if thread_id
+                        else ">  - *Keine Akte gefunden!*"
+                    )
                 ),
                 inline=False,
             )
@@ -2366,7 +2377,6 @@ class AddInsuranceView(discord.ui.View):
     user="Discord-User des Versicherungsnehmers",
     rp_name="RP-Name",
     hbpay_nummer="HBpay Kontonummer",
-    economy_id="Economy-ID",
 )
 async def create_customer(
     interaction: discord.Interaction,
@@ -2374,7 +2384,6 @@ async def create_customer(
     user: discord.Member,
     rp_name: str,
     hbpay_nummer: str,
-    economy_id: str,
 ):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
@@ -2412,7 +2421,6 @@ async def create_customer(
         customer_data = {
             "rp_name": rp_name,
             "hbpay_nummer": hbpay_nummer,
-            "economy_id": economy_id,
             "versicherungen": ins_list,
             "total_monthly_price": total_price,
             "thread_id": None,
@@ -2424,7 +2432,7 @@ async def create_customer(
         }
         embed = build_kundenakte_embed(customer_id, customer_data)
         thread = await forum_channel.create_thread(
-            name=f" {customer_id} | {rp_name}", content="", embed=embed
+            name=f" {customer_id} | {rp_name}", content=user.mention, embed=embed
         )
         customer_data["thread_id"] = thread.thread.id
         data["customers"][customer_id] = customer_data
@@ -2694,8 +2702,8 @@ async def create_invoice(
             inline=False,
         )
         embed.add_field(
-            name="Zahlungsmethoden",
-            value=f"> `-` `{customer['hbpay_nummer']}`\n> `-` `{customer['economy_id']}`",
+            name="Zahlungsmethode",
+            value=f"> `-` `{customer['hbpay_nummer']}`",
             inline=False,
         )
         ins_details = "\n".join(
@@ -3702,8 +3710,193 @@ class InaktivitätsWarnView(discord.ui.View):
 # ═══════════════════════════════════════════════════════
 #   TICKET VIEWS — MODERN DESIGN
 # ═══════════════════════════════════════════════════════
+def get_effective_claimer_id(ticket_info: dict) -> Optional[int]:
+    """
+    Ermittelt den für ein Ticket zuständigen Mitarbeiter.
+    - Schadensmeldung: der Mitarbeiter, der das Ticket über 'Beanspruchen' übernommen hat.
+    - Kundenkontakt: der Mitarbeiter, der das Ticket eröffnet hat (kein separater
+      Beanspruchen-Schritt vorhanden, daher gilt der Öffner als zuständig).
+    """
+    claimed_by = ticket_info.get("claimed_by")
+    if claimed_by:
+        return claimed_by
+    if ticket_info.get("type") == "kundenkontakt":
+        return ticket_info.get("opener_id")
+    return None
+
+
+def get_ticket_customer_member(
+    guild: discord.Guild, ticket_info: dict
+) -> Optional[discord.Member]:
+    """Gibt das Discord-Mitglied des Kunden zurück, der zu diesem Ticket gehört."""
+    customer_id = ticket_info.get("customer_id", "")
+    customer = data["customers"].get(customer_id, {})
+    uid = customer.get("discord_user_id")
+    return guild.get_member(uid) if uid else None
+
+
+class CloseRequestView(discord.ui.View):
+    """View für die Schließanfrage: Annehmen/Ablehnen — ausschließlich für den Kunden."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Annehmen & Schließen",
+        style=discord.ButtonStyle.success,
+        custom_id="close_request_accept",
+    )
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ch_key = str(interaction.channel.id)
+        ticket_info = data.get("ticket_channels", {}).get(ch_key)
+        if not ticket_info:
+            await interaction.response.send_message(
+                embed=build_error_embed(
+                    "Fehler!",
+                    "Ticket-Daten nicht gefunden. Bitte wende dich an einen Administrator.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        customer_member = get_ticket_customer_member(interaction.guild, ticket_info)
+        if not customer_member or interaction.user.id != customer_member.id:
+            await interaction.response.send_message(
+                embed=build_error_embed(
+                    "Zugriff verweigert!",
+                    "Nur der Kunde kann diese Schließanfrage beantworten.",
+                    "Kunde",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        add_log_entry(
+            "SCHLIESSANFRAGE_ANGENOMMEN",
+            interaction.user.id,
+            {"channel_id": interaction.channel.id},
+        )
+        await close_ticket_channel(interaction, interaction.channel, ticket_info)
+
+    @discord.ui.button(
+        label="Ablehnen & Offen halten",
+        style=discord.ButtonStyle.secondary,
+        custom_id="close_request_deny",
+    )
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ch_key = str(interaction.channel.id)
+        ticket_info = data.get("ticket_channels", {}).get(ch_key)
+        if not ticket_info:
+            await interaction.response.send_message(
+                embed=build_error_embed(
+                    "Fehler!",
+                    "Ticket-Daten nicht gefunden. Bitte wende dich an einen Administrator.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        customer_member = get_ticket_customer_member(interaction.guild, ticket_info)
+        if not customer_member or interaction.user.id != customer_member.id:
+            await interaction.response.send_message(
+                embed=build_error_embed(
+                    "Zugriff verweigert!",
+                    "Nur der Kunde kann diese Schließanfrage beantworten.",
+                    "Kunde",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        deny_embed = dvg_embed(
+            "Schließanfrage abgelehnt",
+            f"> {interaction.user.mention} hat die Schließanfrage abgelehnt.\n"
+            f"> Das Ticket bleibt geöffnet.",
+        )
+        await interaction.channel.send(embed=deny_embed)
+        await reenable_close_request_button(interaction.channel, ticket_info)
+        add_log_entry(
+            "SCHLIESSANFRAGE_ABGELEHNT",
+            interaction.user.id,
+            {"channel_id": interaction.channel.id},
+        )
+
+
+async def send_close_request(
+    interaction: discord.Interaction, ticket_info: dict
+) -> None:
+    """Sendet eine Schließanfrage, die vom Kunden angenommen oder abgelehnt werden muss."""
+    request_embed = dvg_embed(
+        "Schließanfrage",
+        f"> {interaction.user.mention} hat beantragt, dieses Ticket zu schließen.\n\n"
+        f"> Bitte akzeptiere oder lehne die Anfrage über die Buttons unten ab.",
+    )
+    await interaction.followup.send(embed=request_embed, view=CloseRequestView())
+
+    ch_key = str(interaction.channel.id)
+    if ch_key in data.get("ticket_channels", {}):
+        data["ticket_channels"][ch_key]["close_request_panel_message_id"] = (
+            interaction.message.id
+        )
+        save_data(data)
+
+    add_log_entry(
+        "SCHLIESSANFRAGE_GESTELLT",
+        interaction.user.id,
+        {"channel_id": interaction.channel.id},
+    )
+
+
+async def reenable_close_request_button(
+    channel: discord.abc.Messageable, ticket_info: dict
+) -> None:
+    """Aktiviert den Schließanfrage-Button im Ticket-Panel wieder (z.B. nach Ablehnung)."""
+    panel_msg_id = ticket_info.get("close_request_panel_message_id")
+    if not panel_msg_id:
+        return
+    try:
+        panel_msg = await channel.fetch_message(panel_msg_id)
+    except (discord.NotFound, discord.Forbidden):
+        panel_msg = None
+
+    if panel_msg is not None:
+        if ticket_info.get("type") == "kundenkontakt":
+            new_view = KundenkontaktTicketView()
+        else:
+            new_view = SchadensmeldungTicketView()
+            claimed_by = ticket_info.get("claimed_by")
+            if claimed_by:
+                for child in new_view.children:
+                    if getattr(child, "custom_id", "") == "sd_claim_release":
+                        child.label = "Freigeben"
+                        child.style = discord.ButtonStyle.secondary
+        for child in new_view.children:
+            if getattr(child, "custom_id", "") in (
+                "sd_close_ticket",
+                "kk_close_ticket",
+            ):
+                child.disabled = False
+        try:
+            await panel_msg.edit(view=new_view)
+        except discord.NotFound:
+            pass
+
+    ch_key = str(channel.id)
+    if ch_key in data.get("ticket_channels", {}):
+        data["ticket_channels"][ch_key].pop("close_request_panel_message_id", None)
+        save_data(data)
+
+
 class SchadensmeldungTicketView(discord.ui.View):
-    """View für Schadensmeldungs-Tickets: Beanspruchen/Freigeben + Schließen."""
+    """View für Schadensmeldungs-Tickets: Beanspruchen/Freigeben + Schließanfrage."""
 
     def __init__(self):
         super().__init__(timeout=None)
@@ -3822,55 +4015,87 @@ class SchadensmeldungTicketView(discord.ui.View):
             )
 
     @discord.ui.button(
-        label="Ticket schließen",
+        label="Schließanfrage",
         style=discord.ButtonStyle.danger,
         custom_id="sd_close_ticket",
     )
     async def close_ticket(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        if not is_mitarbeiter(interaction):
+        ch_key = str(interaction.channel.id)
+        ticket_info = data.get("ticket_channels", {}).get(ch_key, {})
+        claimer_id = get_effective_claimer_id(ticket_info)
+        if not (
+            (claimer_id is not None and interaction.user.id == claimer_id)
+            or is_leitungsebene(interaction)
+        ):
             await interaction.response.send_message(
                 embed=build_error_embed(
                     "Zugriff verweigert!",
-                    "Nur Mitarbeiter können Tickets schließen.",
-                    "Mitarbeiter",
+                    "Nur der Mitarbeiter, der dieses Ticket beansprucht hat, oder die Leitungsebene können eine Schließanfrage stellen.",
+                    "Beanspruchender Mitarbeiter / Leitungsebene",
                 ),
                 ephemeral=True,
             )
             return
-        ch_key = str(interaction.channel.id)
-        ticket_info = data.get("ticket_channels", {}).get(ch_key, {})
-        await close_ticket_channel(interaction, interaction.channel, ticket_info)
+        if ticket_info.get("close_request_panel_message_id"):
+            await interaction.response.send_message(
+                embed=build_error_embed(
+                    "Anfrage bereits gestellt!",
+                    "Es liegt bereits eine offene Schließanfrage für dieses Ticket vor.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+        await send_close_request(interaction, ticket_info)
 
 
 class KundenkontaktTicketView(discord.ui.View):
-    """View für Kundenkontakt-Tickets: Nur Schließen-Button."""
+    """View für Kundenkontakt-Tickets: Nur Schließanfrage-Button."""
 
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Ticket schließen",
+        label="Schließanfrage",
         style=discord.ButtonStyle.danger,
         custom_id="kk_close_ticket",
     )
     async def close_ticket(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        if not is_mitarbeiter(interaction):
+        ch_key = str(interaction.channel.id)
+        ticket_info = data.get("ticket_channels", {}).get(ch_key, {})
+        claimer_id = get_effective_claimer_id(ticket_info)
+        if not (
+            (claimer_id is not None and interaction.user.id == claimer_id)
+            or is_leitungsebene(interaction)
+        ):
             await interaction.response.send_message(
                 embed=build_error_embed(
                     "Zugriff verweigert!",
-                    "Nur Mitarbeiter können Tickets schließen.",
-                    "Mitarbeiter",
+                    "Nur der Mitarbeiter, der dieses Ticket eröffnet hat, oder die Leitungsebene können eine Schließanfrage stellen.",
+                    "Zuständiger Mitarbeiter / Leitungsebene",
                 ),
                 ephemeral=True,
             )
             return
-        ch_key = str(interaction.channel.id)
-        ticket_info = data.get("ticket_channels", {}).get(ch_key, {})
-        await close_ticket_channel(interaction, interaction.channel, ticket_info)
+        if ticket_info.get("close_request_panel_message_id"):
+            await interaction.response.send_message(
+                embed=build_error_embed(
+                    "Anfrage bereits gestellt!",
+                    "Es liegt bereits eine offene Schließanfrage für dieses Ticket vor.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+        await send_close_request(interaction, ticket_info)
 
 
 # Legacy View — bleibt für vor dem Update erstellte Tickets
@@ -4564,7 +4789,7 @@ async def show_customer(
     )
     embed.add_field(
         name="Stammdaten",
-        value=f"> Kunden-ID: `{customer_id}`\n> RP-Name: **{customer['rp_name']}**\n> Kartenzahlung: `{customer['hbpay_nummer']}`\n> Economy-ID: `{customer['economy_id']}`\n> Status: `{customer.get('status', 'aktiv')}`",
+        value=f"> Kunden-ID: `{customer_id}`\n> RP-Name: **{customer['rp_name']}**\n> Kartenzahlung: `{customer['hbpay_nummer']}`\n> Status: `{customer.get('status', 'aktiv')}`",
         inline=False,
     )
 
@@ -4610,7 +4835,9 @@ async def show_customer(
     if thread_id:
         embed.add_field(name="Akte", value=f"> <#{thread_id}>", inline=False)
     embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(
+        content=f"<@{customer['discord_user_id']}>", embed=embed, ephemeral=True
+    )
 
 
 # ═══════════════════════════════════════════════════════
@@ -4785,7 +5012,7 @@ async def cmd_schaden_historie(interaction: discord.Interaction, customer_id: st
 # ═══════════════════════════════════════════════════════
 @bot.tree.command(
     name="portal-zugang",
-    description="Sendet dem Kunden seinen persoenlichen Portal-Zugangscode per DM",
+    description="Generiert einen Portal-Zugangslink für Mitarbeiter (keine DM an den Kunden)",
 )
 @app_commands.describe(customer_id="Versicherungsnehmer-ID")
 @app_commands.autocomplete(customer_id=customer_id_autocomplete)
@@ -4822,45 +5049,15 @@ async def cmd_portal_zugang(interaction: discord.Interaction, customer_id: str):
 
     token = generate_portal_token(customer_id)
     portal_url = f"{BOT_BASE_URL}/portal/{token}" if BOT_BASE_URL else None
-    member = interaction.guild.get_member(customer["discord_user_id"])
-
-    if portal_url and member:
-        dm_embed = dvg_embed(
-            "Ihr DVG Kundenportal-Zugang",
-            "> Ihr persoenlicher Zugangscode wurde erstellt.\n"
-            "> Ueber den Button unten gelangen Sie direkt zu Ihrer Versicherungsübersicht.",
-        )
-        dm_embed.add_field(
-            name="Versicherungsnehmer", value=f"> {customer['rp_name']}", inline=True
-        )
-        dm_embed.add_field(name="Kunden-ID", value=f"> `{customer_id}`", inline=True)
-        dm_embed.add_field(
-            name="Zugangscode",
-            value=f"> ||`{token}`||\n> (Klicken zum Anzeigen — nicht weitergeben!)",
-            inline=False,
-        )
-        link_view = discord.ui.View()
-        link_view.add_item(discord.ui.Button(label="Zum Kundenportal", url=portal_url))
-        try:
-            await member.send(embed=dm_embed, view=link_view)
-            dm_ok = True
-        except discord.Forbidden:
-            dm_ok = False
-    else:
-        dm_ok = False
 
     result = dvg_embed(
-        "Portal-Zugang ausgestellt",
-        f"> Zugangscode für **{customer['rp_name']}** generiert.",
+        "Portal-Zugang",
+        f"> Zugangslink für **{customer['rp_name']}** (`{customer_id}`).",
     )
-    result.add_field(name="Kunden-ID", value=f"> `{customer_id}`", inline=True)
-    result.add_field(
-        name="DM gesendet",
-        value=f"> {'Ja' if dm_ok else 'Nein (DMs gesperrt)'}",
-        inline=True,
-    )
+    link_view = None
     if portal_url:
-        result.add_field(name="Portal-URL", value=f"> {portal_url}", inline=False)
+        link_view = discord.ui.View()
+        link_view.add_item(discord.ui.Button(label="Zum Kundenportal", url=portal_url))
     else:
         result.add_field(
             name="Hinweis",
@@ -4871,9 +5068,9 @@ async def cmd_portal_zugang(interaction: discord.Interaction, customer_id: str):
     add_log_entry(
         "PORTAL_ZUGANG_AUSGESTELLT",
         interaction.user.id,
-        {"customer_id": customer_id, "dm_gesendet": dm_ok},
+        {"customer_id": customer_id},
     )
-    await interaction.followup.send(embed=result, ephemeral=True)
+    await interaction.followup.send(embed=result, view=link_view, ephemeral=True)
 
 
 # ═══════════════════════════════════════════════════════
@@ -6067,10 +6264,6 @@ def build_portal_dashboard(customer_id: str, customer: dict, token: str) -> str:
                 <div>
                   <div class="data-field-lbl">HBpay Kontonummer</div>
                   <div class="data-field-val"><code>{_esc(customer.get("hbpay_nummer", "—"))}</code></div>
-                </div>
-                <div>
-                  <div class="data-field-lbl">Economy-ID</div>
-                  <div class="data-field-val"><code>{_esc(customer.get("economy_id", "—"))}</code></div>
                 </div>
               </div>
             </div>
