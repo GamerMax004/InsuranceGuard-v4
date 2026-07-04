@@ -247,9 +247,9 @@ DVG_RED = 0xB82238
 DVG_PURPLE = 0x5A3D8A
 
 # Tuple mit Role-IDs für Multi-Server-Support
-MITARBEITER_ROLE_ID = (1521541502780833802)
-LEITUNGSEBENE_ROLE_ID = (1521541496216752128)
-FIRMENKONTOROLLE_ROLE_ID = (1521543643213594634)
+MITARBEITER_ROLE_ID = (1408800823571513537, 1495094890298871874)
+LEITUNGSEBENE_ROLE_ID = (1408797319134187601, 1495094890307256559)
+FIRMENKONTOROLLE_ROLE_ID = (1474047313025433684, 1495094890323906564)
 KUNDEN_ROLE_NAME = "Versicherungsnehmer"
 
 FOOTER_ICON = "https://media.discordapp.net/attachments/1473692441726029874/1497915098310901861/IGv4.png?ex=69ef41a5&is=69edf025&hm=1840dd2e17a7eff7b28600d3ac2f4e3bc658ff0fb8f53f73e16292760088d87e&=&format=webp&quality=lossless&width=625&height=625"
@@ -600,13 +600,17 @@ async def close_ticket_channel(
     # ── Log-Kanal ────────────────────────────────────────────────────────────
     log_e = dvg_embed(
         f"Ticket geschlossen{'  –  Inaktivität' if auto_close else ''}",
-        f"> Kanal: `{channel.name}`",
+        f"> <:3280text:1522597774095286313> - `{channel.name}`",
     )
-    log_e.add_field(name="Kunden-ID", value=f"> `{customer_id}`", inline=True)
-    log_e.add_field(name="Geschlossen von", value=f"> {closer_mention}", inline=True)
+    log_e.add_field(
+        name="Kunden-ID",
+        value=f"> <:1226copyid:1522597735205830666> - `{customer_id}`",
+        inline=True,
+    )
     if duration_min:
         h, m = divmod(duration_min, 60)
         log_e.add_field(name="Bearbeitungsdauer", value=f"> `{h}h {m}min`", inline=True)
+    log_e.add_field(name="Geschlossen von", value=f"> {closer_mention}", inline=False)
 
     if transcript_url:
         log_view = discord.ui.View()
@@ -958,12 +962,12 @@ def build_kundenakte_embed(customer_id: str, customer: dict) -> discord.Embed:
     embed = dvg_embed("Versicherungsakte")
     embed.add_field(
         name="Versicherungsnehmer",
-        value=f"> `-` {customer['rp_name']}\n> `-` `{customer_id}`",
+        value=f"> <:8982member:1522597880437932112> - `{customer['rp_name']}`\n> <:1226copyid:1522597735205830666> - `{customer_id}`",
         inline=False,
     )
     embed.add_field(
         name="Zahlungsmethode",
-        value=f"> `-` `{customer['hbpay_nummer']}`",
+        value=f"> <:3469mail:1522597775647178905> - `{customer['hbpay_nummer']}`",
         inline=False,
     )
     ins_text = "\n".join(
@@ -1445,30 +1449,34 @@ async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
 
         embed = discord.Embed(
             title="Suchergebnisse",
-            description=f"> `-` Suchbegriff: `{suchbegriff}`\n> `-` Ergebnisse: `{len(treffer)}`",
+            description=f"> <:2125search:1522597748631801861> - `{suchbegriff}`\n> <:3084channelsandroles:1522597765794758810> - `{len(treffer)}`",
             color=EMBED_COLOR,
             timestamp=get_now(),
         )
         for cid, c in treffer[:10]:
-            status_text = " Aktiv" if c.get("status") == "aktiv" else " Archiviert"
+            status_text = (
+                "<:1571verifieddark:1522597740855689340> - Aktiver Kunde!"
+                if c.get("status") == "aktiv"
+                else "<:3991voiceprivate:1522597781557219448> - Archivierter Kunde!"
+            )
             thread_id = c.get("thread_id")
             versicherungen = (
-                "\n".join(f"> - {ins}" for ins in c.get("versicherungen", []))
+                "\n".join(f"> ▸ {ins}" for ins in c.get("versicherungen", []))
                 or "> `-` *Keine Versicherungen abgeschlossen!*"
             )
             embed.add_field(
                 name=f"{c['rp_name']}",
                 value=(
-                    f"> `-` `{cid}`\n"
-                    f"> `-` `{c['hbpay_nummer']}`\n"
-                    f"> `-` {status_text}\n"
-                    f"> `-` `{c.get('total_monthly_price', 0):,.2f} €/Monat`\n"
+                    f"> <:1226copyid:1522597735205830666> - `{cid}`\n"
+                    f"> <:3469mail:1522597775647178905> - `{c['hbpay_nummer']}`\n"
+                    f"> {status_text}\n"
+                    f"> `{c.get('total_monthly_price', 0):,.2f} €/Monat`\n"
                     + versicherungen[:200]
                     + "\n"
                     + (
-                        f"> `-` <#{thread_id}>"
+                        f"> <:8312activethreads:1522597862779785276> - <#{thread_id}>"
                         if thread_id
-                        else ">  - *Keine Akte gefunden!*"
+                        else "> <:4727quarantinew:1522597801077506133> - *Keine Akte gefunden!*"
                     )
                 ),
                 inline=False,
@@ -2220,11 +2228,6 @@ async def set_channels(
             else:
                 bearbzeit = "> Voraussichtliche Bearbeitungszeit: *N/A*"
             embed_sm.add_field(name="Bearbeitungszeit", value=bearbzeit, inline=False)
-            embed_sm.add_field(
-                name="Hinweis",
-                value="> Pro Kunde kann es nur **eine aktive Schadensmeldung** gleichzeitig geben!",
-                inline=False,
-            )
             embed_sm.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
             await schadensmeldung_panel.send(embed=embed_sm, view=SchadensmeldungView())
             changes.append(f"SM-Panel: {schadensmeldung_panel.mention}")
@@ -2498,7 +2501,7 @@ async def create_customer(
         log_e = dvg_embed("Neue Kundenakte erstellt!")
         log_e.add_field(
             name="Versicherungsnehmer",
-            value=f"> {rp_name}\n> `{customer_id}`",
+            value=f"> <:8982member:1522597880437932112> - `{rp_name}`\n> <:1226copyid:1522597735205830666> - `{customer_id}`",
             inline=False,
         )
         log_e.add_field(name="Discord", value=f"> {user.mention}", inline=True)
@@ -2872,10 +2875,12 @@ async def archive_invoice(interaction: discord.Interaction, invoice_id: str):
                 if thread:
                     ae = dvg_embed(
                         "Archivierte Rechnung",
-                        "Bezahlt. Auszahlungslimit zurückgesetzt.",
+                        "Auszahlungslimit zurückgesetzt.",
                     )
                     ae.add_field(
-                        name="Rechnungs-Nr.", value=f"> `{invoice_id}`", inline=True
+                        name="Rechnungsnr.",
+                        value=f"> <:1226copyid:1522597735205830666> - `{invoice_id}`",
+                        inline=False,
                     )
                     ae.add_field(
                         name="Betrag",
@@ -2884,7 +2889,7 @@ async def archive_invoice(interaction: discord.Interaction, invoice_id: str):
                     )
                     ae.add_field(
                         name="Archiviert von",
-                        value=f"> {interaction.user.mention}",
+                        value=f"> <:3991voiceprivate:1522597781557219448> - {interaction.user.mention}",
                         inline=False,
                     )
                     ae.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
@@ -3228,12 +3233,12 @@ class AuszahlungAntragsModal(discord.ui.Modal, title="Auszahlungsantrag"):
             embed = dvg_embed("Auszahlungsantrag")
             embed.add_field(
                 name="Antragsinformationen",
-                value=f">  `{auszahlung_id}`\n>  `{betrag_float:,.2f} €`",
+                value=f"> <:1226copyid:1522597735205830666> - `{auszahlung_id}`\n> `{betrag_float:,.2f} €`",
                 inline=False,
             )
             embed.add_field(
                 name="Versicherungsnehmer",
-                value=f">  {self.customer['rp_name']}\n>  `{self.customer_id}`",
+                value=f"> <:8982member:1522597880437932112> - `{self.customer['rp_name']}`\n> <:1226copyid:1522597735205830666> - `{self.customer_id}`",
                 inline=False,
             )
             embed.add_field(
@@ -3247,7 +3252,7 @@ class AuszahlungAntragsModal(discord.ui.Modal, title="Auszahlungsantrag"):
             embed.add_field(
                 name="Eingereicht von", value=f"{interaction.user.mention}", inline=True
             )
-            embed.add_field(name="Status", value=">  Ausstehend", inline=True)
+            embed.add_field(name="Status", value="Ausstehend!", inline=False)
             embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
 
             action_view = AuszahlungActionView(
@@ -3334,7 +3339,7 @@ class AuszahlungSelectView(discord.ui.View):
         verfügbar = get_verfügbares_guthaben(self.customer_id, selected)
         if verfügbar <= 0:
             await interaction.response.send_message(
-                f" Limit für `{selected}` ausgeschöpft.", ephemeral=True
+                f"Limit für `{selected}` ausgeschöpft.", ephemeral=True
             )
             return
         await interaction.response.send_modal(
@@ -3365,21 +3370,19 @@ class AuszahlungBestätigenModal(
         try:
             pending = data.get("pending_auszahlungen", {}).get(self.auszahlung_id)
             if not pending or pending.get("status") != "ausstehend":
-                await interaction.followup.send(" Bereits bearbeitet.", ephemeral=True)
+                await interaction.followup.send("Bereits bearbeitet.", ephemeral=True)
                 return
             customer_id = pending["customer_id"]
             versicherung = pending["versicherung"]
             betrag = pending["betrag"]
             customer = data["customers"].get(customer_id)
             if not customer:
-                await interaction.followup.send(
-                    " Kunde nicht gefunden.", ephemeral=True
-                )
+                await interaction.followup.send("Kunde nicht gefunden.", ephemeral=True)
                 return
             verfügbar = get_verfügbares_guthaben(customer_id, versicherung)
             if betrag > verfügbar:
                 await interaction.followup.send(
-                    f" Guthaben reicht nicht aus (`{verfügbar:,.2f} €` verfügbar).",
+                    f"Guthaben reicht nicht aus (`{verfügbar:,.2f} €` verfügbar).",
                     ephemeral=True,
                 )
                 return
@@ -3412,13 +3415,13 @@ class AuszahlungBestätigenModal(
                         )
                         ve = dvg_embed("Auszahlungsvermerk")
                         ve.add_field(
-                            name="Antrags-ID",
-                            value=f"> `{self.auszahlung_id}`\n> Versicherung: `{versicherung}`\n> [Zur Auszahlungsnachricht]({self.auszahlungs_link.value})",
+                            name="Antragsantrag",
+                            value=f"> <:1226copyid:1522597735205830666> - `{self.auszahlung_id}`\n> <:1821serversfolder:1522597744030777405> - `{versicherung}`\n> <:7926copymessagelink:1522597855905316914> - [Auszahlungsnachricht]({self.auszahlungs_link.value})",
                             inline=False,
                         )
                         ve.add_field(
                             name="Details",
-                            value=f"> Verfügbar vorher: `{verfügbar:,.2f} €`\n> Ausgezahlt: `-{betrag:,.2f} €`\n> **Restguthaben: `{neues_guthaben:,.2f} €`**",
+                            value=f"> Verfügbar: `{verfügbar:,.2f} €`\n> Ausgezahlt: `-{betrag:,.2f} €`\n> **Restguthaben: `{neues_guthaben:,.2f} €`**",
                             inline=False,
                         )
                         ve.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
@@ -3436,7 +3439,7 @@ class AuszahlungBestätigenModal(
                         for i, field in enumerate(upd.fields):
                             if field.name == "Status":
                                 upd.set_field_at(
-                                    i, name="Status", value="Genehmigt", inline=True
+                                    i, name="Status", value="Genehmigt!", inline=True
                                 )
                                 break
                         upd.add_field(
@@ -3553,7 +3556,7 @@ class AuszahlungActionView(discord.ui.View):
             upd.color = COLOR_ERROR
             for i, field in enumerate(upd.fields):
                 if field.name == "Status":
-                    upd.set_field_at(i, name="Status", value=" Abgelehnt", inline=True)
+                    upd.set_field_at(i, name="Status", value="Abgelehnt!", inline=True)
                     break
             upd.add_field(
                 name="Abgelehnt von", value=f"{interaction.user.mention}", inline=True
@@ -3565,7 +3568,7 @@ class AuszahlungActionView(discord.ui.View):
             "AUSZAHLUNG_ABGELEHNT", interaction.user.id, {"auszahlung_id": az_id}
         )
         await interaction.response.send_message(
-            f" Antrag `{az_id}` wurde abgelehnt.", ephemeral=True
+            f"Antrag `{az_id}` wurde abgelehnt.", ephemeral=True
         )
 
 
@@ -5242,8 +5245,8 @@ async def cmd_blacklist_liste(interaction: discord.Interaction):
             e.add_field(
                 name=f"{cust.get('rp_name', 'Unbekannt')} — `{cid}`",
                 value=(
-                    f"> `-` Grund: {entry.get('grund', '—')}\n"
-                    f"> `-` Gesperrt: `{added}` von {adder.mention if adder else '—'}"
+                    f"> <:8056engagedinsuspectedspamactiv:1522597859109900328> -  {entry.get('grund', '*N/A*')}\n"
+                    f"> <:3156editsecurityactions:1522597767359496202> - `{added}` von {adder.mention if adder else '*N/A*'}"
                 ),
                 inline=False,
             )
@@ -5310,7 +5313,7 @@ async def auto_backup():
         )
         e.add_field(
             name="Enthaltene Dateien",
-            value="> `-` `insurance_data.json`\n> `-` `bot_config.json`",
+            value="> <:1821serversfolder:1522597744030777405> - `insurance_data.json`\n> <:1821serversfolder:1522597744030777405> - `bot_config.json`",
             inline=False,
         )
         e.add_field(
