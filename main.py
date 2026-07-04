@@ -556,7 +556,7 @@ async def close_ticket_channel(
 
     # ── Close-Embed ──────────────────────────────────────────────────────────
     title_text = (
-        "Ticket automatisch geschlossen" if auto_close else "Ticket geschlossen"
+        "Ticket automatisch geschlossen!" if auto_close else "Ticket geschlossen!"
     )
     desc_parts = [
         "**Bearbeitung abgeschlossen.**"
@@ -564,11 +564,11 @@ async def close_ticket_channel(
         else "**Wegen Inaktivität automatisch geschlossen.**"
     ]
     desc_parts.append(
-        f"> Kanal wird in **5 Sekunden** gelöscht." if not auto_close else ""
+        f"> Kanal wird in **5 Sekunden** gelöscht." if not auto_close else "*N/A*"
     )
     if duration_min:
         h, m = divmod(duration_min, 60)
-        desc_parts.append(f"> Bearbeitungsdauer: `{h}h {m}min`")
+        desc_parts.append(f"> <:8810datetime:1522597873286512777> - `{h}h {m}min`")
 
     close_embed = dvg_embed(title_text, "\n".join(p for p in desc_parts if p))
     if not auto_close:
@@ -605,11 +605,11 @@ async def close_ticket_channel(
     log_e.add_field(
         name="Kunden-ID",
         value=f"> <:1226copyid:1522597735205830666> - `{customer_id}`",
-        inline=True,
+        inline=False,
     )
     if duration_min:
         h, m = divmod(duration_min, 60)
-        log_e.add_field(name="Bearbeitungsdauer", value=f"> `{h}h {m}min`", inline=True)
+        log_e.add_field(name="Bearbeitungsdauer", value=f"> <:8810datetime:1522597873286512777> - `{h}h {m}min`", inline=False)
     log_e.add_field(name="Geschlossen von", value=f"> {closer_mention}", inline=False)
 
     if transcript_url:
@@ -680,7 +680,7 @@ async def _send_inactivity_warning(
     )
     warn_embed.add_field(
         name="Automatisches Schließen um",
-        value=f"> `{auto_close_time.strftime('%d.%m.%Y • %H:%M Uhr')}`",
+        value=f"> `{auto_close_time.strftime('%d.%m.%Y, %H:%M Uhr')}`",
         inline=False,
     )
     warn_embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
@@ -3745,8 +3745,8 @@ class CloseRequestView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Annehmen & Schließen",
-        style=discord.ButtonStyle.success,
+        label="Schließen",
+        style=discord.ButtonStyle.danger,
         custom_id="close_request_accept",
     )
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3786,7 +3786,7 @@ class CloseRequestView(discord.ui.View):
         await close_ticket_channel(interaction, interaction.channel, ticket_info)
 
     @discord.ui.button(
-        label="Ablehnen & Offen halten",
+        label="Abbrechen",
         style=discord.ButtonStyle.secondary,
         custom_id="close_request_deny",
     )
@@ -3820,9 +3820,8 @@ class CloseRequestView(discord.ui.View):
         await interaction.response.edit_message(view=self)
 
         deny_embed = dvg_embed(
-            "Schließanfrage abgelehnt",
-            f"> {interaction.user.mention} hat die Schließanfrage abgelehnt.\n"
-            f"> Das Ticket bleibt geöffnet.",
+            "Schließanfrage abgelehnt!",
+            f"> {interaction.user.mention} hat die Schließanfrage abgelehnt."
         )
         await interaction.channel.send(embed=deny_embed)
         await reenable_close_request_button(interaction.channel, ticket_info)
@@ -3839,7 +3838,7 @@ async def send_close_request(
     """Sendet eine Schließanfrage, die vom Kunden angenommen oder abgelehnt werden muss."""
     request_embed = dvg_embed(
         "Schließanfrage",
-        f"> {interaction.user.mention} hat beantragt, dieses Ticket zu schließen.\n\n"
+        f"> {interaction.user.mention} hat beantragt, dieses Ticket zu schließen.\n"
         f"> Bitte akzeptiere oder lehne die Anfrage über die Buttons unten ab.",
     )
     await interaction.followup.send(embed=request_embed, view=CloseRequestView())
@@ -3962,10 +3961,8 @@ class SchadensmeldungTicketView(discord.ui.View):
             )
 
             claim_embed = dvg_embed(
-                "Ticket beansprucht",
-                f"> {interaction.user.mention} hat dieses Ticket übernommen.\n"
-                f"> Andere Mitarbeiter haben keinen Schreibzugriff mehr.\n"
-                f"> Freigeben über den `Freigeben` Button.",
+                "Ticket beansprucht!",
+                f"> {interaction.user.mention} hat dieses Ticket übernommen."
             )
             await interaction.channel.send(embed=claim_embed)
             add_log_entry(
@@ -4006,9 +4003,8 @@ class SchadensmeldungTicketView(discord.ui.View):
                 await interaction.channel.set_permissions(old_claimer, overwrite=None)
 
             release_embed = dvg_embed(
-                "Ticket freigegeben",
-                f"> {interaction.user.mention} hat das Ticket freigegeben.\n"
-                f"> Alle Mitarbeiter haben wieder Schreibzugriff.",
+                "Ticket freigegeben!",
+                f"> {interaction.user.mention} hat das Ticket freigegeben."
             )
             await interaction.channel.send(embed=release_embed)
             add_log_entry(
@@ -4243,20 +4239,15 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
 
             ins_types = get_insurance_types()
             embed = discord.Embed(
-                title="Kundenkontakt-Ticket", color=EMBED_COLOR, timestamp=get_now()
+                title="Kundenkontakt", color=EMBED_COLOR, timestamp=get_now()
             )
             embed.add_field(
                 name="Ticketinformationen",
                 value=(
-                    f"> Erstellt: `{get_now().strftime('%d.%m.%Y • %H:%M')}`\n"
-                    f"> Kunden-ID: `{customer_id}`\n"
-                    f"> Bearbeiter: {interaction.user.mention}"
+                    f"> <:8810datetime:1522597873286512777> - `{get_now().strftime('%d.%m.%Y, %H:%M')} Uhr`\n"
+                    f"> <:1226copyid:1522597735205830666> - `{customer_id}`\n"
+                    f"> <:8982member:1522597880437932112> - `{customer['rp_name']}`"
                 ),
-                inline=False,
-            )
-            embed.add_field(
-                name="Versicherungsnehmer",
-                value=f"> RP-Name: **{customer['rp_name']}**\n> Discord: {customer_user.mention if customer_user else '`Unbekannt`'}",
                 inline=False,
             )
             embed.add_field(
@@ -4264,15 +4255,10 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
                 value=f"```{self.reason.value[:500]}```",
                 inline=False,
             )
-            ins_info = "\n".join(f"> `-` {ins}" for ins in customer["versicherungen"])
+            ins_info = "\n".join(f"> ▸ {ins}" for ins in customer["versicherungen"])
             embed.add_field(
                 name="Versicherungsübersicht",
-                value=f"{ins_info}\n> Monatsbeitrag: `{customer['total_monthly_price']:,.2f} €`",
-                inline=False,
-            )
-            embed.add_field(
-                name="Schreibrechte",
-                value="> Leitungsebene + Ticketersteller können schreiben.\n> Andere Mitarbeiter haben Leserechte.",
+                value=f"{ins_info}\n> `{customer['total_monthly_price']:,.2f} €/Monat`",
                 inline=False,
             )
             embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
@@ -4493,14 +4479,15 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
             embed.add_field(
                 name="Fallinformationen",
                 value=(
-                    f"> Kunde: **{customer['rp_name']}** (`{customer_id}`)\n"
-                    f"> Eingereicht: {get_now().strftime('%d.%m.%Y, %H:%M Uhr')}"
+                    f"> <:8982member:1522597880437932112> - `{customer['rp_name']}`\n"
+                    f"> <:1226copyid:1522597735205830666> - `{customer_id}`\n"
+                    f"> <:8810datetime:1522597873286512777> - `{get_now().strftime('%d.%m.%Y, %H:%M Uhr')}`"
                 ),
                 inline=False,
             )
             embed.add_field(
                 name="Beteiligte Personen",
-                value=f"> Geschädigter: **{self.Geschädigter.value}**\n> Täter: **{self.Täter.value}**",
+                value=f"> <:8683communication:1522597868278644817> - `{self.Geschädigter.value}`\n> <:8056engagedinsuspectedspamactiv:1522597859109900328> - `{self.Täter.value}`",
                 inline=False,
             )
             embed.add_field(
@@ -4509,12 +4496,7 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
                 inline=False,
             )
             embed.add_field(
-                name="Nachweis / Rechnung", value=f"> `{nachweis_val}`", inline=False
-            )
-            embed.add_field(
-                name="Bearbeitung",
-                value="> Ticket mit **Beanspruchen** übernehmen.\n> Leitungsebene behält jederzeit Schreibrechte.",
-                inline=False,
+                name="Nachweis (Rechnung)", value=f"> <:7896pinned:1522597854223274065> - `{nachweis_val}`", inline=False
             )
 
             ma_ping = " ".join(r.mention for r in ma_roles) if ma_roles else ""
@@ -4608,7 +4590,7 @@ async def add_user_to_ticket(interaction: discord.Interaction, user: discord.Mem
     )
     e = discord.Embed(
         title="Person hinzugefügt!",
-        description=f"> {interaction.user.mention} hat {user.mention} hinzugefügt.",
+        description=f"{interaction.user.mention} hat {user.mention} hinzugefügt.",
         color=EMBED_COLOR,
     )
     e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
@@ -4641,7 +4623,7 @@ async def remove_user_from_ticket(
     await interaction.channel.set_permissions(user, overwrite=None)
     e = discord.Embed(
         title="Person entfernt!",
-        description=f"> {interaction.user.mention} hat {user.mention} entfernt.",
+        description=f"{interaction.user.mention} hat {user.mention} entfernt.",
         color=EMBED_COLOR,
     )
     e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
