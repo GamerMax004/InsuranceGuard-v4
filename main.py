@@ -1310,7 +1310,7 @@ async def modul_cmd(interaction: discord.Interaction, aktion: str):
         title="Modul aktiviert!" if aktiv else "Modul deaktiviert!",
         description=(
             f"> **Versicherungsfirma** wurde {'aktiviert' if aktiv else 'deaktiviert'}!\n"
-            f"> `-` **`{len(synced)}`** Befehle synchronisiert"
+            f"> <:commands:1522597835839639683> **`{len(synced)}`** Befehle synchronisiert"
         ),
         color=EMBED_COLOR if aktiv else COLOR_WARNING,
         timestamp=get_now(),
@@ -2297,7 +2297,7 @@ class InsuranceSelect(discord.ui.Select):
         ins_types = get_insurance_types()
         total = sum(ins_types[ins]["price"] for ins in self.values)
         preview = "\n".join(
-            f"> `-` {ins} — {ins_types[ins]['price']:,.2f}€" for ins in self.values
+            f"> <:1821serversfolder:1522597744030777405> {ins} — {ins_types[ins]['price']:,.2f}€" for ins in self.values
         )
         e = discord.Embed(
             title="Versicherungen ausgewählt!",
@@ -2532,7 +2532,7 @@ async def create_customer(
             inline=False,
         )
         s.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        s.set_author(text=AUTHOR_NAME, icon_url=AUTHOR_ICON)
+        s.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
         await interaction.edit_original_response(embed=s, view=None)
     except Exception as e:
         logger.error(f"Kundenakte Fehler: {e}", exc_info=True)
