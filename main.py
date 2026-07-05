@@ -2202,6 +2202,7 @@ async def set_channels(
                 inline=False,
             )
             embed_kk.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
+            embed_kk.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
             await kundenkontakt_panel.send(embed=embed_kk, view=KundenkontaktView())
             changes.append(f"KK-Panel: {kundenkontakt_panel.mention}")
             panel_results.append(f" Kundenkontakt-Panel gesendet")
@@ -2242,6 +2243,7 @@ async def set_channels(
                 bearbzeit = "> Voraussichtliche Bearbeitungszeit: *N/A*"
             embed_sm.add_field(name="Bearbeitungszeit", value=bearbzeit, inline=False)
             embed_sm.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
+            embed_sm.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
             await schadensmeldung_panel.send(embed=embed_sm, view=SchadensmeldungView())
             changes.append(f"SM-Panel: {schadensmeldung_panel.mention}")
             panel_results.append(f" Schadensmeldungs-Panel gesendet")
@@ -2522,6 +2524,7 @@ async def create_customer(
             name="Aussteller", value=f"> <:mitarbeiter:1522597807352057928> {interaction.user.mention}", inline=False
         )
         log_e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
+        log_e.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
         await send_to_log_channel(interaction.guild, log_e)
 
         s = dvg_embed("Kundenakte erfolgreich angelegt!",
@@ -3436,6 +3439,7 @@ class AuszahlungBestätigenModal(
                             value=f"> Verfügbar: `{verfügbar:,.2f}€`\n> Ausgezahlt: `-{betrag:,.2f}€`\n> **Restguthaben: `{neues_guthaben:,.2f}€`**",
                             inline=False,
                         )
+                        ve.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
                         ve.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
                         await thread.send(embed=ve)
                 except Exception as ex:
@@ -4575,8 +4579,8 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
             s = dvg_embed(
                 "Schadensmeldung eingereicht!", f" <:5975popout:1522597818127220816> {ticket_channel.mention}"
             )
-            s.set_author(name=None, icon_url=None)
-            s.set_footer(text=None, icon_url=None)
+            s.set_author(name="", icon_url="")
+            s.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
             await interaction.followup.send(embed=s, ephemeral=True)
         except Exception as e:
             logger.error(f"Schadensmeldung Fehler: {e}")
