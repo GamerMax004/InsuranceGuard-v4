@@ -252,7 +252,7 @@ LEITUNGSEBENE_ROLE_ID = (1408797319134187601, 1495094890307256559)
 FIRMENKONTOROLLE_ROLE_ID = (1474047313025433684, 1495094890323906564)
 KUNDEN_ROLE_NAME = "Versicherungsnehmer"
 
-FOOTER_ICON = "https://media.discordapp.net/attachments/1473692441726029874/1497915098310901861/IGv4.png?ex=69ef41a5&is=69edf025&hm=1840dd2e17a7eff7b28600d3ac2f4e3bc658ff0fb8f53f73e16292760088d87e&=&format=webp&quality=lossless&width=625&height=625"
+FOOTER_ICON = "https://images-ext-1.discordapp.net/external/ymktlgwOVtfgthFaYKgqoi_FnuvFhkhYFAT5Zri83Kw/%3Fsize%3D4096/https/cdn.discordapp.com/avatars/1494338524705718412/0bd737c851d6993ec6a38563bc3f2ee0.png?format=webp&quality=lossless&width=230&height=230"
 AUTOMOD_ICON = "https://media.discordapp.net/attachments/1473692441726029874/1473692787156455474/1072-automod.png?ex=699722dc&is=6995d15c&hm=08ad340d3673e1f1076cbf73d235ea3b0e8ef10b07abb8d24ea66d85c6b59edb&=&format=webp&quality=lossless&width=250&height=250"
 AUTHOR_ICON = "https://images-ext-1.discordapp.net/external/oaegfwZ-7BSrD3Q4oHp7bYcKEU4bzeHPyYOn-ePhVNM/%3Fsize%3D4096/https/cdn.discordapp.com/icons/1408794976615268384/70aeea0005d728278f7f78e94b580d45.png?format=webp&quality=lossless&width=624&height=624"
 FOOTER_TEXT = "Copyright © InsuranceGuard v4"
@@ -605,7 +605,7 @@ async def close_ticket_channel(
     )
     log_e.add_field(
         name="Kanal", 
-        value=f"> <:3084channelsandroles:1522597765794758810> `{channel.name}`", 
+        value=f"> <:channel:1522597774095286313> `{channel.name}`", 
         inline=False
     )
     log_e.add_field(
@@ -1483,7 +1483,7 @@ async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
                     f"> <:id:1522597735205830666> `{cid}`\n"
                     f"> <:hbpay:1522597775647178905> `{c['hbpay_nummer']}`\n"
                     f"> {status_text}\n"
-                    f"> `{c.get('total_monthly_price', 0):,.2f}€/Monat`\n"
+                    f"> <:6509addguild:1522597829917413396> `{c.get('total_monthly_price', 0):,.2f}€/Monat`\n"
                     + versicherungen[:200]
                     + "\n"
                     + (
@@ -2512,20 +2512,20 @@ async def create_customer(
         await update_customer_thread_backup(interaction.guild, customer_id)
 
         log_e = dvg_embed("Neue Kundenakte erstellt!",
-                         description="Diese Kundenakte wurde soeben angelegt. Eine Übersicht der wichtigsten Informationen finden Sie nachfolgend.")
+                         description="Diese Kundenakte wurde soeben angelegt. Eine Übersicht der wichtigsten Informationen finden Sie nachfolgend aufgelistet.")
         log_e.add_field(
             name="Versicherungsnehmer",
             value=f"> <:member:1522597880437932112> `{rp_name}`\n> <:id:1522597735205830666> `{customer_id}`\n> <:6509addguild:1522597829917413396> `{total_price:,.2f}€/Monat`",
             inline=False,
         )
         log_e.add_field(
-            name="Aussteller", value=f"> <:4902partner:1522597807352057928> {interaction.user.mention}", inline=False
+            name="Aussteller", value=f"> <:mitarbeiter:1522597807352057928> {interaction.user.mention}", inline=False
         )
         log_e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
         await send_to_log_channel(interaction.guild, log_e)
 
         s = dvg_embed("Kundenakte erfolgreich angelegt!",
-                     description="Diese Kundenakte wurde soeben angelegt. Eine Übersicht der wichtigsten Informationen finden Sie nachfolgend.")
+                     description="Diese Kundenakte wurde soeben angelegt. Eine Übersicht der wichtigsten Informationen finden Sie nachfolgend aufgelistet.")
         s.add_field(
             name="Informationen",
             value=f"> <:id:1522597735205830666> `{customer_id}`\n> <:8312activethreads:1522597862779785276> {thread.thread.mention}\n> <:6509addguild:1522597829917413396> `{total_price:,.2f}€`\n> <:4426news:1522597790897803374> DM gesendet!",
@@ -3262,7 +3262,7 @@ class AuszahlungAntragsModal(discord.ui.Modal, title="Auszahlungsantrag"):
                 name="Beschreibung", value=f"```{beschreibung_tx}```", inline=False
             )
             embed.add_field(
-                name="Eingereicht von", value=f"{interaction.user.mention}", inline=True
+                name="Eingereicht von", value=f" {interaction.user.mention}", inline=True
             )
             embed.add_field(name="Status", value="Ausstehend!", inline=False)
             embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
@@ -3976,8 +3976,9 @@ class SchadensmeldungTicketView(discord.ui.View):
 
             claim_embed = dvg_embed(
                 "Ticket beansprucht!",
-                f"> {interaction.user.mention} hat dieses Ticket übernommen."
+                f"{interaction.user.mention} hat dieses Ticket übernommen."
             )
+            claim_embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
             await interaction.channel.send(embed=claim_embed)
             add_log_entry(
                 "TICKET_BEANSPRUCHT",
@@ -4018,8 +4019,9 @@ class SchadensmeldungTicketView(discord.ui.View):
 
             release_embed = dvg_embed(
                 "Ticket freigegeben!",
-                f"> {interaction.user.mention} hat das Ticket freigegeben."
+                f"{interaction.user.mention} hat das Ticket freigegeben."
             )
+            release_embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
             await interaction.channel.send(embed=release_embed)
             add_log_entry(
                 "TICKET_FREIGEGEBEN",
@@ -4275,6 +4277,7 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
                 value=f"{ins_info}\n> <:8558viewasrolearrow:1522597865350889472>  `{customer['total_monthly_price']:,.2f}€/Monat`",
                 inline=False,
             )
+            embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
             embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
 
             mentions = [interaction.user.mention] + (
@@ -4570,9 +4573,10 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
             )
 
             s = dvg_embed(
-                "Schadensmeldung eingereicht!", f"> <:5975popout:1522597818127220816> {ticket_channel.mention}"
+                "Schadensmeldung eingereicht!", f" <:5975popout:1522597818127220816> {ticket_channel.mention}"
             )
-            s.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
+            s.set_author(name=None, icon_url=None)
+            s.set_footer(text=None, icon_url=None)
             await interaction.followup.send(embed=s, ephemeral=True)
         except Exception as e:
             logger.error(f"Schadensmeldung Fehler: {e}")
@@ -4790,7 +4794,7 @@ async def show_customer(
     )
     embed.add_field(
         name="Stammdaten",
-        value=f"> Kunden-ID: `{customer_id}`\n> RP-Name: **{customer['rp_name']}**\n> Kartenzahlung: `{customer['hbpay_nummer']}`\n> Status: `{customer.get('status', 'aktiv')}`",
+        value=f"> <:member:1522597880437932112> `{customer['rp_name']}`\n> <:id:1522597735205830666> `{customer_id}`\n> <:hbpay:1522597775647178905> `{customer['hbpay_nummer']}`",
         inline=False,
     )
 
@@ -4824,17 +4828,18 @@ async def show_customer(
     )
     embed.add_field(
         name="Rechnungsübersicht",
-        value=f"> Offen: `{off_re}`\n> Bezahlt: `{bez_re}`\n> Monatsbeitrag: `{customer['total_monthly_price']:,.2f}€`",
-        inline=False,
-    )
-    embed.add_field(
-        name="Metadaten",
-        value=f"> Angelegt: {make_aware(datetime.fromisoformat(customer['created_at'])).strftime('%d.%m.%Y • %H:%M Uhr')}\n> Discord: <@{customer['discord_user_id']}>",
+        value=f"> <a:ausstehend:1522597723872952461> `{off_re}`\n> <:archiviert:1522597781557219448> `{bez_re}`\n> <:6509addguild:1522597829917413396> `{customer['total_monthly_price']:,.2f}€`",
         inline=False,
     )
     thread_id = customer.get("thread_id")
     if thread_id:
-        embed.add_field(name="Akte", value=f"> <#{thread_id}>", inline=False)
+        embed.add_field(name="Versicherungsakte", value=f"> <:8312activethreads:1522597862779785276> <#{thread_id}>", inline=False)
+
+    embed.add_field(
+        name="Systemdaten (Erstellung)",
+        value=f"> <:datetime:1522597873286512777> {make_aware(datetime.fromisoformat(customer['created_at'])).strftime('%d.%m.%Y, %H:%M Uhr')}\n> <:mitarbeiter:1522597807352057928> <@{customer['discord_user_id']}>",
+        inline=False,
+    )
     embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
     await interaction.response.send_message(
         content=f"<@{customer['discord_user_id']}>", embed=embed, ephemeral=True
@@ -5055,6 +5060,7 @@ async def cmd_portal_zugang(interaction: discord.Interaction, customer_id: str):
         "Portal-Zugang",
         f"> Zugangslink für **{customer['rp_name']}** (`{customer_id}`).",
     )
+    result.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
     link_view = None
     if portal_url:
         link_view = discord.ui.View()
@@ -5365,7 +5371,7 @@ async def _do_panel_refresh() -> bool:
                 f"> Basierend auf {len(sm_stats)} abgeschlossenen Vorgängen."
             )
         else:
-            bearbzeit = "> Voraussichtliche Bearbeitungszeit: **wird nach ersten Vorgängen ermittelt**"
+            bearbzeit = "> Voraussichtliche Bearbeitungszeit: *N/A*"
 
         for guild in bot.guilds:
             ch = guild.get_channel(sm_ch_id)
