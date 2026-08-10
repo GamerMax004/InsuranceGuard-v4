@@ -994,7 +994,7 @@ def build_kundenakte_embed(customer_id: str, customer: dict) -> discord.Embed:
     )
     embed.add_field(
         name="Gesamtbeitrag (monatlich)",
-        value=f"> <:einzahlung:1522597871051079710> `{total_price:,.2f}€/Monat` zzgl. 3% Steuern",
+        value=f"> <:einzahlung:1522597871051079710> `{total_price:,.2f}€/Monat` zzgl. 19% Steuern",
         inline=False,
     )
     embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
