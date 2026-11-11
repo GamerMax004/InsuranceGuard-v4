@@ -13,6 +13,9 @@ import io
 import zipfile
 import uuid
 import html as html_lib
+import re
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional, List, Dict, Tuple, Set
 
 # ═══════════════════════════════════════════════════════
@@ -56,12 +59,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 DATA_FILE = "insurance_data.json"
 CONFIG_FILE = "bot_config.json"
-
-# Transcript-Verzeichnis anlegen (für Online-Dashboard)
-# Umgebungsvariable BOT_BASE_URL auf die öffentliche Render-URL setzen,
-# z.B. https://insuranceguard.onrender.com → Links werden dann generiert
-os.makedirs("transcripts", exist_ok=True)
-BOT_BASE_URL = os.environ.get("BOT_BASE_URL", "").rstrip("/")
 
 # ═══════════════════════════════════════════════════════
 #   STANDARD-KONFIGURATION
@@ -216,16 +213,15 @@ def generate_auszahlung_id() -> str:
 # ═══════════════════════════════════════════════════════
 #   FARBEN & KONSTANTEN —  DVG Corporate Design
 # ═══════════════════════════════════════════════════════
-#  Invisible-Border-Farbe: entspricht exakt dem Discord-Embed-Hintergrund
-#  (#2B2D31 Dark Mode) → der farbige Streifen links ist optisch nicht sichtbar.
-#  Alle visuellen Unterschiede kommen aus Titel, Beschreibung und Struktur.
-EMBED_COLOR = 0x393A41
+#  Farben dienen als Statussignal (farbiger Rand der Container):
+#  Blau = Standard, Grün = Erfolg, Orange = Warnung, Rot = Fehler.
+EMBED_COLOR = 0x3D4EC5  # DVG-Blau als Standard-Akzent der Container
 
 # Legacy-Aliase (werden intern nicht mehr direkt genutzt, aber falls externe
 # Referenzen bestehen bleiben sie vorhanden)
-EMBED_SUCCESS = 0x27AE5F
+EMBED_SUCCESS = 0x57F287
 EMBED_WARNING = 0xE67E22
-EMBED_ERROR = 0xC03A2B
+EMBED_ERROR = 0xD83C3E
 
 # Legacy-Aliase
 COLOR_PRIMARY = EMBED_COLOR
@@ -235,6 +231,7 @@ COLOR_ERROR = EMBED_ERROR
 COLOR_INFO = EMBED_COLOR
 COLOR_DAMAGE = EMBED_COLOR
 COLOR_CLAIM = EMBED_COLOR
+DESIGN_COLOR = EMBED_COLOR  # Standard-Akzentfarbe der Container
 
 # DVG-Akzentfarben
 DVG_BLUE = 0x3D4EC5
@@ -260,33 +257,444 @@ AUTHOR_NAME = "Deutsche Versicherungsgesellschaft"
 
 
 # ═══════════════════════════════════════════════════════
+#   EHRN DESIGN-SYSTEM — Components V2 (discord.py 2.6+)
+# ═══════════════════════════════════════════════════════
+#  Jede Bot-Nachricht ist ein Container mit farbigem Rand:
+#  Überschrift → Trennlinie → Inhalt → (Buttons) → Hinweis → Fußzeile.
+#  Fehler: roter Container ohne Fußzeile. Niemand wird gepingt, außer
+#  über eine eigene Ping-Zeile über dem Container (siehe ev(..., ping=...)).
+#  Bestehende discord.Embed-Objekte werden von ev() automatisch umgewandelt.
+# ═══════════════════════════════════════════════════════
+DESIGN_FOOTER = "**DVG - Deutsche Versicherungsgesellschaft**"
+MAX_TEXT = 3800  # Discord erlaubt 4.000 Zeichen Text pro Nachricht
+
+SEPARATOR = object()
+NO_MENTIONS = discord.AllowedMentions.none()
+PING_MENTIONS = discord.AllowedMentions(
+    everyone=False, users=True, roles=True, replied_user=False
+)
+
+
+class DEmbed(discord.Embed):
+    """Embed mit zusätzlichen Design-Flags (big = ##-Überschrift für Dokumente/Panels)."""
+
+    big: bool = False
+
+
+def _unquote(text) -> str:
+    """Entfernt die alten Zitat-Präfixe '> ' (altes Embed-Design) zeilenweise."""
+    if text is None:
+        return ""
+    lines = [re.sub(r"^\s*>\s?", "", ln) for ln in str(text).split("\n")]
+    return "\n".join(lines).strip()
+
+
+def _field_text(name: str, value: str) -> str:
+    name = str(name or "").strip()
+    value = _unquote(value)
+    if not value:
+        return f"**{name}**" if name else ""
+    if not name or name in ("\u200b", "‎"):
+        return value
+    if "\n" in value or len(value) > 70 or value.startswith("```"):
+        return f"**{name}**\n{value}"
+    if name.endswith(("!", ":", "?")) or ":" in name:
+        return f"**{name}** {value}"
+    return f"**{name}:** {value}"
+
+
+def _ts_style(dt, style="f") -> str:
+    return f"<t:{int(dt.timestamp())}:{style}>"
+
+
+def _split_rows(items) -> list:
+    """Verteilt Buttons/Menüs auf Action Rows (Menü = eigene Zeile, max. 5 Buttons)."""
+    rows, current = [], None
+    for item in items:
+        if isinstance(item, discord.ui.Select):
+            rows.append(discord.ui.ActionRow(item))
+            current = None
+            continue
+        if current is None or len(current.children) >= 5:
+            current = discord.ui.ActionRow()
+            rows.append(current)
+        current.add_item(item)
+    return rows[:5]
+
+
+def build_container(
+    embed: Optional[discord.Embed],
+    items=None,
+    *,
+    extra_files: Optional[List[str]] = None,
+) -> discord.ui.Container:
+    """Wandelt ein (altes) Embed in einen EHRN-Container um."""
+    color = DESIGN_COLOR
+    heading = ""
+    body = ""
+    hint = ""
+    show_footer = True
+    stamp = None
+
+    if embed is not None:
+        if embed.color is not None and embed.color.value is not None:
+            color = embed.color.value
+        is_error = color == COLOR_ERROR
+        show_footer = not is_error
+        big = bool(getattr(embed, "big", False))
+        if embed.title:
+            heading = f"{'##' if big else '###'} {str(embed.title).strip()}"
+        desc = _unquote(embed.description)
+        field_blocks = [
+            t for t in (_field_text(f.name, f.value) for f in embed.fields) if t
+        ]
+        parts = []
+        if desc:
+            parts.append(desc)
+        if field_blocks:
+            parts.append("\n\n".join(field_blocks))
+        body = "\n\n".join(parts)
+        if embed.footer and embed.footer.text and embed.footer.text != FOOTER_TEXT:
+            hint = f"-# {embed.footer.text.strip()}"
+        if embed.timestamp and show_footer:
+            stamp = embed.timestamp
+
+    # Sicherheitsnetz: Discord erlaubt max. 4.000 Zeichen Text je Nachricht
+    footer = f"-# {DESIGN_FOOTER}" + (f" · {_ts_style(stamp)}" if stamp else "")
+    budget = MAX_TEXT - len(heading) - len(hint) - len(footer) - 40
+    if len(body) > budget:
+        cut = body[:budget].rsplit("\n", 1)[0]
+        body = cut + "\n-# … weitere Einträge gekürzt"
+
+    container = discord.ui.Container(accent_colour=color)
+    if heading:
+        container.add_item(discord.ui.TextDisplay(heading))
+    if heading and (body or items):
+        container.add_item(
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small)
+        )
+    if body:
+        container.add_item(discord.ui.TextDisplay(body))
+    for fname in extra_files or []:
+        container.add_item(discord.ui.File(f"attachment://{fname}"))
+    rows = _split_rows(items or [])
+    if rows:
+        if body:
+            container.add_item(
+                discord.ui.Separator(
+                    visible=True, spacing=discord.SeparatorSpacing.small
+                )
+            )
+        for row in rows:
+            container.add_item(row)
+    if hint:
+        container.add_item(discord.ui.TextDisplay(hint))
+    if show_footer:
+        container.add_item(discord.ui.TextDisplay(footer))
+    return container
+
+
+class EView(discord.ui.LayoutView):
+    """
+    Ersatz für discord.ui.View: Buttons/Menüs werden wie gewohnt per
+    @discord.ui.button / add_item angelegt, aber im Container gerendert.
+    Der Inhalt (Embed) wird beim Senden über ev(embed, view) übergeben.
+    """
+
+    __ev_specs__: tuple = ()
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        specs = []
+        for base in reversed(cls.__mro__):
+            for member in base.__dict__.values():
+                if hasattr(member, "__discord_ui_model_type__") and not getattr(
+                    member, "__discord_ui_parent__", None
+                ):
+                    specs.append(member)
+        cls.__ev_specs__ = tuple(specs)
+
+    def __init__(self, *, timeout: Optional[float] = 180.0):
+        super().__init__(timeout=timeout)
+        self._ev_items: list = []
+        self._ev_ping: Optional[str] = None
+        for func in type(self).__ev_specs__:
+            item = func.__discord_ui_model_type__(**func.__discord_ui_model_kwargs__)
+            item.callback = self._make_callback(func, item)
+            self._ev_items.append(item)
+
+    def _make_callback(self, func, item):
+        async def _cb(interaction: discord.Interaction):
+            await func(self, interaction, item)
+
+        return _cb
+
+    # — View-kompatible API (statt .children bitte .controls verwenden) —
+    @property
+    def controls(self) -> list:
+        """Alle Buttons/Menüs dieser Ansicht (entspricht dem alten View.children)."""
+        return list(self._ev_items)
+
+    def add_item(self, item):
+        self._ev_items.append(item)
+        return self
+
+    def remove_item(self, item):
+        if item in self._ev_items:
+            self._ev_items.remove(item)
+        return self
+
+    def clear_items(self):
+        self._ev_items.clear()
+        return self
+
+    def render(
+        self,
+        embed: Optional[discord.Embed] = None,
+        ping: Optional[str] = None,
+        files: Optional[List[str]] = None,
+    ):
+        """Baut den Container neu auf (Embed + aktuelle Buttons/Menüs)."""
+        discord.ui.LayoutView.clear_items(self)
+        if ping:
+            discord.ui.LayoutView.add_item(self, discord.ui.TextDisplay(ping))
+        discord.ui.LayoutView.add_item(
+            self, build_container(embed, self._ev_items, extra_files=files)
+        )
+        return self
+
+
+def _plain_view() -> EView:
+    return EView(timeout=None)
+
+
+def ev(
+    embed: Optional[discord.Embed] = None,
+    view: Optional[EView] = None,
+    ping: Optional[str] = None,
+    file: Optional[str] = None,
+) -> dict:
+    """Kwargs für send()/send_message()/followup.send()/edit(): view=… + allowed_mentions."""
+    layout = view if view is not None else _plain_view()
+    if not isinstance(layout, EView):
+        raise TypeError("ev() erwartet eine EView")
+    layout.render(embed, ping, [file] if file else None)
+    return {"view": layout, "allowed_mentions": PING_MENTIONS if ping else NO_MENTIONS}
+
+
+_ERROR_HINTS = re.compile(
+    r"fehler|ungültig|nicht gefunden|nicht konfiguriert|überschreit|reicht nicht|"
+    r"muss > |nicht möglich|nicht gesetzt|ausgeschöpft|bereits bearbeitet|nicht mehr",
+    re.I,
+)
+
+
+def ev_text(
+    text: str, ping: Optional[str] = None, error: Optional[bool] = None
+) -> dict:
+    """Kurze Textantwort im Container-Design (Fehler = roter Container ohne Fußzeile)."""
+    text = str(text).strip()
+    if error is None:
+        error = bool(_ERROR_HINTS.search(text))
+    e = DEmbed(description=text, color=COLOR_ERROR if error else DESIGN_COLOR)
+    if error:
+        e.title = None
+    return ev(e, ping=ping)
+
+
+def _walk_components(components):
+    for comp in components or []:
+        yield comp
+        for attr in ("children", "components"):
+            sub = getattr(comp, attr, None)
+            if sub:
+                yield from _walk_components(sub)
+        acc = getattr(comp, "accessory", None)
+        if acc is not None:
+            yield from _walk_components([acc])
+
+
+def message_custom_ids(message: discord.Message) -> set:
+    """Alle custom_ids der Buttons/Menüs einer Nachricht (klassisch und V2)."""
+    return {
+        getattr(c, "custom_id", None)
+        for c in _walk_components(message.components)
+        if getattr(c, "custom_id", None)
+    }
+
+
+def ev_msg(message: discord.Message, view: EView) -> dict:
+    """
+    Kwargs zum Bearbeiten einer BESTEHENDEN Nachricht, bei der nur die Buttons
+    geändert werden (Text bleibt erhalten). Funktioniert für V2-Nachrichten und
+    für alte Embed-Nachrichten aus der Zeit vor dem Design-Update.
+    """
+    kwargs: dict = {"allowed_mentions": NO_MENTIONS}
+    if message.flags.components_v2:
+        layout = discord.ui.LayoutView.from_message(message, timeout=view.timeout)
+        for top in list(layout.children):
+            if isinstance(top, discord.ui.Container):
+                for child in list(top.children):
+                    if isinstance(child, discord.ui.ActionRow):
+                        top.remove_item(child)
+                rows = _split_rows(view.controls)
+                # Reihen vor Hinweis/Fußzeile (die letzten TextDisplays) einfügen
+                texts_tail = []
+                while (
+                    top.children
+                    and isinstance(top.children[-1], discord.ui.TextDisplay)
+                    and len(texts_tail) < 2
+                    and top.children[-1].content.startswith("-#")
+                ):
+                    texts_tail.insert(0, top.children[-1])
+                    top.remove_item(top.children[-1])
+                if rows:
+                    if not (
+                        top.children
+                        and isinstance(top.children[-1], discord.ui.Separator)
+                    ):
+                        top.add_item(
+                            discord.ui.Separator(
+                                visible=True, spacing=discord.SeparatorSpacing.small
+                            )
+                        )
+                    for row in rows:
+                        top.add_item(row)
+                for t in texts_tail:
+                    top.add_item(t)
+                break
+        kwargs["view"] = layout
+        return kwargs
+    # Alte Embed-Nachricht → in das neue Design überführen
+    embed = message.embeds[0] if message.embeds else None
+    kwargs.update(ev(embed, view))
+    kwargs["embeds"] = []
+    kwargs["content"] = None
+    return kwargs
+
+
+def v2_edit(
+    message: discord.Message,
+    embed: discord.Embed,
+    view: Optional[EView] = None,
+    ping: Optional[str] = None,
+) -> dict:
+    """Kwargs zum vollständigen Neu-Rendern einer Nachricht (auch alte Embed-Nachrichten)."""
+    kwargs = ev(embed, view, ping)
+    kwargs["allowed_mentions"] = NO_MENTIONS  # Bearbeitungen pingen nie erneut
+    if message.embeds or message.content or not message.flags.components_v2:
+        kwargs["embeds"] = []
+        kwargs["content"] = None
+    return kwargs
+
+
+def restyle(
+    message: discord.Message,
+    fields: Optional[list] = None,
+    color: Optional[int] = None,
+    drop_controls: bool = True,
+) -> dict:
+    """
+    Ändert eine bestehende Bot-Nachricht (Status-Updates).
+    fields: Liste von (Präfix, Name, Wert) — ersetzt den Feld-Block, der mit **Präfix
+    beginnt, oder hängt ihn an. Funktioniert für V2-Nachrichten und alte Embed-Nachrichten.
+    """
+    fields = fields or []
+    if message.flags.components_v2:
+        layout = discord.ui.LayoutView.from_message(message, timeout=None)
+        for top in layout.children:
+            if not isinstance(top, discord.ui.Container):
+                continue
+            if color is not None:
+                top.accent_colour = color
+            if drop_controls:
+                for child in list(top.children):
+                    if isinstance(child, discord.ui.ActionRow):
+                        top.remove_item(child)
+            texts = [c for c in top.children if isinstance(c, discord.ui.TextDisplay)]
+            body_candidates = [
+                t for t in texts if not t.content.startswith(("#", "-#"))
+            ]
+            body = (
+                max(body_candidates, key=lambda t: len(t.content))
+                if body_candidates
+                else None
+            )
+            for prefix, name, value in fields:
+                new_block = _field_text(name, value)
+                done = False
+                for t in texts:
+                    blocks = t.content.split("\n\n")
+                    for i, blk in enumerate(blocks):
+                        if blk.lstrip().startswith(f"**{prefix}"):
+                            blocks[i] = new_block
+                            t.content = "\n\n".join(blocks)
+                            done = True
+                            break
+                    if done:
+                        break
+                if not done and body is not None:
+                    body.content = f"{body.content}\n\n{new_block}"
+            break
+        return {"view": layout, "allowed_mentions": NO_MENTIONS}
+    # Alte Embed-Nachricht → ins neue Design überführen
+    emb = DEmbed.from_dict(message.embeds[0].to_dict()) if message.embeds else DEmbed()
+    if color is not None:
+        emb.color = color
+    for prefix, name, value in fields:
+        idx = next(
+            (i for i, f in enumerate(emb.fields) if str(f.name).startswith(prefix)),
+            None,
+        )
+        if idx is None:
+            emb.add_field(name=name, value=value, inline=False)
+        else:
+            emb.set_field_at(idx, name=name, value=value, inline=False)
+    kw = ev(emb)
+    kw["embeds"] = []
+    kw["content"] = None
+    kw["allowed_mentions"] = NO_MENTIONS
+    return kw
+
+
+def register_persistent(view: "EView") -> None:
+    """Registriert eine persistente Ansicht (Buttons funktionieren nach Neustarts weiter)."""
+    view.render(DEmbed(title="Persistente Ansicht"))
+    bot.add_view(view)
+
+
+# ═══════════════════════════════════════════════════════
 #   HILFSFUNKTIONEN
 # ═══════════════════════════════════════════════════════
 async def send_to_log_channel(
-    guild: discord.Guild, embed: discord.Embed, view: Optional[discord.ui.View] = None
+    guild: discord.Guild,
+    embed: discord.Embed,
+    view: Optional["EView"] = None,
+    file: Optional[discord.File] = None,
 ):
     if config.get("log_channel_id"):
         try:
             ch = guild.get_channel(config["log_channel_id"])
             if ch:
-                await ch.send(embed=embed, view=view)
+                if file:
+                    await ch.send(file=file, **ev(embed, view=view, file=file.filename))
+                else:
+                    await ch.send(**ev(embed, view=view))
         except Exception as e:
             logger.error(f"Log-Channel Fehler: {e}")
 
 
 # ── DVG Embed-Builder ────────────────────────────────────────────────────────
-def dvg_embed(title: str, description: str = "") -> discord.Embed:
+def dvg_embed(title: str, description: str = "", big: bool = False) -> DEmbed:
     """
-    Erstellt ein standardisiertes DVG-Embed.
-    Unsichtbarer Rand (EMBED_COLOR = Discord-Embed-Hintergrund),
-    einheitlicher Author + Footer gemäß DVG Corporate Design.
+    Erstellt ein DVG-Embed-Objekt, das ev() automatisch in einen EHRN-Container
+    umwandelt (Überschrift, Trennlinie, Inhalt, Fußzeile).
     """
     kwargs: dict = {"title": title, "color": EMBED_COLOR, "timestamp": get_now()}
     if description:
         kwargs["description"] = description
-    e = discord.Embed(**kwargs)
-    e.set_author(name=AUTHOR_NAME, icon_url=FOOTER_ICON)
-    e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
+    e = DEmbed(**kwargs)
+    e.big = big
     return e
 
 
@@ -301,12 +709,19 @@ async def send_to_dokumentation_channel(
     if not ch:
         return
     try:
-        e = discord.Embed(title="Dokumentation", color=EMBED_COLOR, timestamp=get_now())
-        e.add_field(name="Mitarbeiter", value=f"> <:member:1522597880437932112> {mitarbeiter.mention}", inline=False)
-        e.add_field(name="Vorgang", value=f"> <:3084channelsandroles:1522597765794758810> {vorgang}", inline=False)
+        e = DEmbed(title="Dokumentation", color=EMBED_COLOR, timestamp=get_now())
+        e.add_field(
+            name="Mitarbeiter",
+            value=f"> <:member:1522597880437932112> {mitarbeiter.mention}",
+            inline=False,
+        )
+        e.add_field(
+            name="Vorgang",
+            value=f"> <:3084channelsandroles:1522597765794758810> {vorgang}",
+            inline=False,
+        )
         e.add_field(name="Anliegen", value=f"> {anliegen}", inline=False)
-        e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        await ch.send(embed=e)
+        await ch.send(**ev(e))
     except Exception as ex:
         logger.error(f"Dokumentationskanal Fehler: {ex}")
 
@@ -328,28 +743,157 @@ def create_backup() -> Optional[str]:
 
 
 # ═══════════════════════════════════════════════════════
-#   TRANSCRIPT — HTML GENERATOR (Discord-Style Dashboard)
+#   TRANSCRIPT — HTML-DATEI (Discord-Style)
 # ═══════════════════════════════════════════════════════
-def _esc(text: str) -> str:
-    """HTML-escapet einen String und wandelt Zeilenumbrüche in <br> um."""
-    return html_lib.escape(str(text)).replace("\n", "<br>")
+#  Beim Schließen eines Tickets wird ein vollständiges Transkript als
+#  HTML-Datei erzeugt und als Anhang gesendet (kein Link, kein Web-Server).
+#  Enthalten sind alle Nachrichten: Text, Anhänge, Embeds, Container,
+#  Antworten, Sticker, Systemnachrichten und weitergeleitete Nachrichten.
+# ═══════════════════════════════════════════════════════
+_RE_CODEBLOCK = re.compile(r"```(?:[a-zA-Z0-9_+-]*\n)?(.*?)```", re.S)
 
 
-def _render_embed_html(embed: discord.Embed) -> str:
-    color = f"#{embed.color.value:06x}" if embed.color else "#5865f2"
+def _esc(text) -> str:
+    """HTML-escapet einen String."""
+    return html_lib.escape(str(text if text is not None else ""))
+
+
+def _fmt_ts(unix: int, style: str = "f") -> str:
+    dt = datetime.fromtimestamp(unix, GERMANY_TZ)
+    if style == "d":
+        return dt.strftime("%d.%m.%Y")
+    if style == "t":
+        return dt.strftime("%H:%M")
+    if style == "T":
+        return dt.strftime("%H:%M:%S")
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
+def _inline_html(text: str, guild: Optional[discord.Guild]) -> str:
+    """Inline-Markdown + Erwähnungen + Emojis + Zeitstempel → HTML."""
+    spans: List[str] = []
+
+    def _stash(m):
+        spans.append(f"<code>{m.group(1)}</code>")
+        return f"\x00{len(spans) - 1}\x00"
+
+    s = html_lib.escape(str(text))
+    s = re.sub(r"`([^`\n]+)`", _stash, s)
+
+    def _user(m):
+        uid = int(m.group(1))
+        member = guild.get_member(uid) if guild else None
+        return f'<span class="mention">@{_esc(member.display_name) if member else "Nutzer"}</span>'
+
+    def _role(m):
+        role = guild.get_role(int(m.group(1))) if guild else None
+        return f'<span class="mention">@{_esc(role.name) if role else "Rolle"}</span>'
+
+    def _chan(m):
+        ch = guild.get_channel_or_thread(int(m.group(1))) if guild else None
+        return f'<span class="mention">#{_esc(ch.name) if ch else "kanal"}</span>'
+
+    s = re.sub(r"&lt;@!?(\d+)&gt;", _user, s)
+    s = re.sub(r"&lt;@&amp;(\d+)&gt;", _role, s)
+    s = re.sub(r"&lt;#(\d+)&gt;", _chan, s)
+    s = re.sub(
+        r"&lt;t:(\d+)(?::([a-zA-Z]))?&gt;",
+        lambda m: f'<span class="mention">{_fmt_ts(int(m.group(1)), m.group(2) or "f")}</span>',
+        s,
+    )
+    s = re.sub(
+        r"&lt;(a?):([A-Za-z0-9_]+):(\d+)&gt;",
+        lambda m: (
+            f'<img class="emoji" alt=":{m.group(2)}:" '
+            f'src="https://cdn.discordapp.com/emojis/{m.group(3)}.{"gif" if m.group(1) else "png"}?size=32">'
+        ),
+        s,
+    )
+    s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+    s = re.sub(r"__(.+?)__", r"<u>\1</u>", s)
+    s = re.sub(r"~~(.+?)~~", r"<s>\1</s>", s)
+    s = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<em>\1</em>", s)
+    s = re.sub(r"(?<![\w])_(?!\s)(.+?)(?<!\s)_(?![\w])", r"<em>\1</em>", s)
+    s = re.sub(
+        r"(https?://[^\s<]+)",
+        r'<a href="\1" target="_blank" rel="noopener">\1</a>',
+        s,
+    )
+    return re.sub(r"\x00(\d+)\x00", lambda m: spans[int(m.group(1))], s)
+
+
+def _lines_html(text: str, guild: Optional[discord.Guild]) -> str:
+    out = []
+    for ln in text.split("\n"):
+        if not ln.strip():
+            out.append('<div class="gap"></div>')
+            continue
+        m = re.match(r"^(#{1,3})\s+(.*)$", ln)
+        if m:
+            out.append(
+                f'<div class="h{len(m.group(1))}">{_inline_html(m.group(2), guild)}</div>'
+            )
+            continue
+        m = re.match(r"^-#\s+(.*)$", ln)
+        if m:
+            out.append(f'<div class="sub">{_inline_html(m.group(1), guild)}</div>')
+            continue
+        m = re.match(r"^>\s?(.*)$", ln)
+        if m:
+            out.append(f'<div class="quote">{_inline_html(m.group(1), guild)}</div>')
+            continue
+        out.append(f'<div class="line">{_inline_html(ln, guild)}</div>')
+    return "".join(out)
+
+
+def _md_html(text: Optional[str], guild: Optional[discord.Guild] = None) -> str:
+    """Discord-Markdown → HTML (inkl. Codeblöcken)."""
+    if not text:
+        return ""
+    out, pos = [], 0
+    for m in _RE_CODEBLOCK.finditer(text):
+        out.append(_lines_html(text[pos : m.start()], guild))
+        out.append(f'<pre class="code">{_esc(m.group(1).strip(chr(10)))}</pre>')
+        pos = m.end()
+    out.append(_lines_html(text[pos:], guild))
+    return "".join(out)
+
+
+def _color_hex(value, default: str = "#4e5058") -> str:
+    try:
+        if value is None:
+            return default
+        raw = value.value if hasattr(value, "value") else int(value)
+        return f"#{raw:06x}"
+    except Exception:
+        return default
+
+
+def _render_embed_html(
+    embed: discord.Embed, guild: Optional[discord.Guild] = None
+) -> str:
+    """Klassische Embeds (z. B. von anderen Bots oder aus älteren Tickets)."""
     parts: List[str] = []
+    if embed.author and embed.author.name:
+        parts.append(f'<div class="embed-author">{_esc(embed.author.name)}</div>')
     if embed.title:
         if embed.url:
             parts.append(
-                f'<a href="{html_lib.escape(embed.url)}" target="_blank" class="embed-title-link">{_esc(embed.title)}</a>'
+                f'<a href="{_esc(embed.url)}" target="_blank" class="embed-title-link">{_esc(embed.title)}</a>'
             )
         else:
             parts.append(f'<div class="embed-title">{_esc(embed.title)}</div>')
     if embed.description:
-        parts.append(f'<div class="embed-desc">{_esc(embed.description)}</div>')
+        parts.append(
+            f'<div class="embed-desc">{_md_html(embed.description, guild)}</div>'
+        )
     inline_group: List[str] = []
     for field in embed.fields:
-        fh = f'<div class="field-block{"--inline" if field.inline else ""}"><div class="field-name">{_esc(field.name)}</div><div class="field-value">{_esc(field.value)}</div></div>'
+        fh = (
+            f'<div class="field-block{"--inline" if field.inline else ""}">'
+            f'<div class="field-name">{_inline_html(field.name, guild)}</div>'
+            f'<div class="field-value">{_md_html(field.value, guild)}</div></div>'
+        )
         if field.inline:
             inline_group.append(fh)
         else:
@@ -359,56 +903,176 @@ def _render_embed_html(embed: discord.Embed) -> str:
             parts.append(fh)
     if inline_group:
         parts.append(f'<div class="field-row">{"".join(inline_group)}</div>')
+    if embed.image and embed.image.url:
+        parts.append(
+            f'<img class="embed-img" src="{_esc(embed.image.url)}" loading="lazy">'
+        )
     if embed.footer and embed.footer.text:
         parts.append(f'<div class="embed-footer">{_esc(embed.footer.text)}</div>')
-    return f'<div class="embed" style="border-left:4px solid {color}">{"".join(parts)}</div>'
+    return f'<div class="embed" style="border-left:4px solid {_color_hex(embed.color, "#5865f2")}">{"".join(parts)}</div>'
+
+
+def _render_component_html(comp, guild: Optional[discord.Guild] = None) -> str:
+    """Components V2 (Container, Text, Trennlinien, Buttons …) → HTML."""
+    kind = getattr(getattr(comp, "type", None), "name", "")
+    if kind == "container":
+        inner = "".join(_render_component_html(c, guild) for c in comp.children)
+        return f'<div class="embed" style="border-left:4px solid {_color_hex(getattr(comp, "accent_colour", None))}">{inner}</div>'
+    if kind == "text_display":
+        return f'<div class="cv-text">{_md_html(comp.content, guild)}</div>'
+    if kind == "separator":
+        return '<hr class="sep">'
+    if kind == "section":
+        inner = "".join(_render_component_html(c, guild) for c in comp.children)
+        acc = _render_component_html(comp.accessory, guild) if comp.accessory else ""
+        return f'<div class="cv-section"><div>{inner}</div>{acc}</div>'
+    if kind == "thumbnail":
+        url = getattr(comp.media, "url", "")
+        return f'<img class="thumb" src="{_esc(url)}" loading="lazy">' if url else ""
+    if kind == "media_gallery":
+        return "".join(
+            f'<img class="embed-img" src="{_esc(it.media.url)}" loading="lazy">'
+            for it in comp.items
+            if getattr(it.media, "url", None)
+        )
+    if kind == "file":
+        name = getattr(comp, "name", None) or "Datei"
+        url = getattr(comp.media, "url", "")
+        return f'<div class="attachment"><a href="{_esc(url)}" target="_blank">📎 {_esc(name)}</a></div>'
+    if kind == "action_row":
+        chips = "".join(_render_component_html(c, guild) for c in comp.children)
+        return f'<div class="row">{chips}</div>'
+    if kind == "button":
+        label = _esc(getattr(comp, "label", None) or "")
+        emoji = getattr(comp, "emoji", None)
+        emo = f"{_esc(str(emoji))} " if emoji and not getattr(emoji, "id", None) else ""
+        return f'<span class="btn{" off" if getattr(comp, "disabled", False) else ""}">{emo}{label}</span>'
+    if kind in (
+        "select",
+        "user_select",
+        "role_select",
+        "mentionable_select",
+        "channel_select",
+    ):
+        return f'<span class="btn off">{_esc(getattr(comp, "placeholder", None) or "Auswahlmenü")}</span>'
+    return ""
+
+
+def _render_body_html(source, guild: Optional[discord.Guild]) -> str:
+    """Rendert Inhalt, Anhänge, Embeds und Komponenten einer Nachricht (oder eines Snapshots)."""
+    body = ""
+    if getattr(source, "content", None):
+        body += f'<div class="msg-text">{_md_html(source.content, guild)}</div>'
+    for att in getattr(source, "attachments", []) or []:
+        ctype = getattr(att, "content_type", "") or ""
+        if ctype.startswith("image/"):
+            body += (
+                f'<div class="attachment"><a href="{_esc(att.url)}" target="_blank">'
+                f'<img class="embed-img" src="{_esc(att.url)}" loading="lazy" alt="{_esc(att.filename)}"></a></div>'
+            )
+        else:
+            body += f'<div class="attachment"><a href="{_esc(att.url)}" target="_blank">📎 {_esc(att.filename)}</a></div>'
+    for emb in getattr(source, "embeds", []) or []:
+        body += _render_embed_html(emb, guild)
+    for comp in getattr(source, "components", []) or []:
+        body += _render_component_html(comp, guild)
+    for st in getattr(source, "stickers", []) or []:
+        body += f'<div class="attachment">Sticker: {_esc(getattr(st, "name", "Sticker"))}</div>'
+    return body
 
 
 def generate_transcript_html(
-    channel_name: str, customer_name: str, ticket_type: str, messages: list
+    channel_name: str,
+    customer_name: str,
+    ticket_type: str,
+    messages: list,
+    guild: Optional[discord.Guild] = None,
 ) -> str:
     type_labels = {
         "schadensmeldung": "Schadensmeldung",
         "kundenkontakt": "Kundenkontakt",
     }
-    type_label = type_labels.get(ticket_type, ticket_type.capitalize())
+    type_label = type_labels.get(ticket_type, str(ticket_type).capitalize())
     msgs_html = ""
     prev_id = None
+    shown = 0
 
     for msg in messages:
         ts = msg.created_at.astimezone(GERMANY_TZ).strftime("%d.%m.%Y %H:%M")
-        is_cont = (prev_id == msg.author.id) and not msg.embeds and not msg.attachments
+        edited = " <span class='edited'>(bearbeitet)</span>" if msg.edited_at else ""
+
+        # Systemnachrichten (Anheften, Beitritte, …)
+        if msg.type not in (discord.MessageType.default, discord.MessageType.reply):
+            sys_text = getattr(msg, "system_content", "") or ""
+            snap_only = bool(getattr(msg, "message_snapshots", None))
+            if sys_text and not snap_only:
+                msgs_html += f'<div class="sysmsg">{_esc(sys_text)} <span class="ts">{ts}</span></div>'
+                shown += 1
+                prev_id = None
+                continue
+
+        body = ""
+        # Antwort-Vorschau
+        ref = getattr(msg, "reference", None)
+        resolved = getattr(ref, "resolved", None) if ref else None
+        if (
+            isinstance(resolved, discord.Message)
+            and msg.type == discord.MessageType.reply
+        ):
+            snippet = (resolved.content or "Anhang / Embed")[:120]
+            body += (
+                f'<div class="reply">↪ <strong>{_esc(resolved.author.display_name)}</strong> '
+                f"{_esc(snippet)}</div>"
+            )
+        body += _render_body_html(msg, guild)
+
+        # Weitergeleitete Nachrichten
+        for snap in getattr(msg, "message_snapshots", []) or []:
+            snap_ts = (
+                snap.created_at.astimezone(GERMANY_TZ).strftime("%d.%m.%Y %H:%M")
+                if getattr(snap, "created_at", None)
+                else ""
+            )
+            inner = (
+                _render_body_html(snap, guild)
+                or '<div class="msg-text"><em>(leer)</em></div>'
+            )
+            body += (
+                f'<div class="fwd"><div class="fwd-label">↪ Weitergeleitet'
+                f'{f" · {snap_ts}" if snap_ts else ""}</div>{inner}</div>'
+            )
+        if not body:
+            body = '<div class="msg-text"><em>(keine Inhalte)</em></div>'
+
+        is_cont = (
+            prev_id == msg.author.id
+            and not msg.embeds
+            and not msg.components
+            and not getattr(msg, "message_snapshots", None)
+            and msg.type == discord.MessageType.default
+        )
         prev_id = msg.author.id
+        shown += 1
 
         av = (
-            (str(msg.author.avatar.url).split("?")[0] + "?size=64")
-            if msg.author.avatar
+            (str(msg.author.display_avatar.url).split("?")[0] + "?size=64")
+            if msg.author.display_avatar
             else f"https://cdn.discordapp.com/embed/avatars/{msg.author.id % 6}.png"
         )
         uc = "#5865f2" if msg.author.bot else "#f2f3f5"
 
-        body = ""
-        if msg.content:
-            body += f'<div class="msg-text">{_esc(msg.content)}</div>'
-        for att in msg.attachments:
-            body += f'<div class="attachment"><a href="{html_lib.escape(att.url)}" target="_blank">📎 {_esc(att.filename)}</a></div>'
-        for emb in msg.embeds:
-            body += _render_embed_html(emb)
-        if not body:
-            continue
-
         if not is_cont:
-            msgs_html += f'''
+            msgs_html += f"""
 <div class="msg-group">
-  <img class="avatar" src="{av}" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'" loading="lazy">
+  <img class="avatar" src="{_esc(av)}" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'" loading="lazy">
   <div class="msg-body">
     <div class="msg-header">
       <span class="username" style="color:{uc}">{_esc(msg.author.display_name)}</span>
       {"<span class='bot-tag'>BOT</span>" if msg.author.bot else ""}
-      <span class="ts">{ts}</span>
+      <span class="ts">{ts}</span>{edited}
     </div>{body}
   </div>
-</div>'''
+</div>"""
         else:
             msgs_html += f'<div class="msg-cont">{body}</div>'
 
@@ -429,19 +1093,37 @@ a { color:#00b0f4; text-decoration:none } a:hover { text-decoration:underline }
 .msg-header { display:flex; align-items:baseline; gap:8px; margin-bottom:2px }
 .username { font-weight:600 }
 .bot-tag { background:#5865f2; color:#fff; font-size:9px; font-weight:700; padding:1px 5px; border-radius:3px; text-transform:uppercase; letter-spacing:.3px }
-.ts { color:#949ba4; font-size:11px }
-.msg-text { white-space:pre-wrap; word-break:break-word }
+.ts { color:#949ba4; font-size:11px } .edited { color:#949ba4; font-size:10px }
+.msg-text, .cv-text, .embed-desc, .field-value { word-break:break-word }
+.line { white-space:pre-wrap } .gap { height:8px }
+.h1 { font-size:20px; font-weight:700; color:#fff; margin:4px 0 } .h2 { font-size:18px; font-weight:700; color:#fff; margin:4px 0 } .h3 { font-size:16px; font-weight:700; color:#fff; margin:3px 0 }
+.sub { font-size:12px; color:#949ba4 }
+.quote { border-left:3px solid #4e5058; padding-left:10px; margin:1px 0 }
+.mention { background:rgba(88,101,242,.3); color:#c9cdfb; border-radius:3px; padding:0 2px }
+code { background:#1e1f22; border-radius:3px; padding:1px 4px; font-size:13px }
+pre.code { background:#1e1f22; border:1px solid #232428; border-radius:4px; padding:8px 10px; margin:4px 0; white-space:pre-wrap; font-size:13px }
+.emoji { width:20px; height:20px; vertical-align:-4px }
 .attachment { color:#00b0f4; font-size:13px; margin-top:3px }
-.embed { background:#2b2d31; border-radius:0 4px 4px 0; padding:12px 16px; margin-top:4px; max-width:520px }
+.embed { background:#2b2d31; border-radius:0 4px 4px 0; padding:12px 16px; margin-top:4px; max-width:560px }
+.embed-author { color:#dcddde; font-size:13px; font-weight:600; margin-bottom:4px }
 .embed-title { color:#fff; font-weight:600; margin-bottom:4px }
 .embed-title-link { color:#00b0f4; font-weight:600; display:block; margin-bottom:4px }
-.embed-desc { color:#dcddde; font-size:14px; margin-bottom:6px; white-space:pre-wrap; word-break:break-word }
+.embed-desc { color:#dcddde; font-size:14px; margin-bottom:6px }
+.embed-img, .thumb { max-width:100%; max-height:320px; border-radius:4px; margin-top:6px }
+.cv-text { font-size:14px; margin:2px 0 } .sep { border:0; border-top:1px solid #3f4147; margin:8px 0 }
+.cv-section { display:flex; justify-content:space-between; gap:12px } .thumb { max-width:80px; max-height:80px }
+.row { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px }
+.btn { background:#4e5058; color:#fff; font-size:13px; font-weight:600; padding:4px 12px; border-radius:4px } .btn.off { opacity:.5 }
 .field-row { display:flex; flex-wrap:wrap; gap:12px; margin-top:6px }
 .field-block, .field-block--inline { margin-top:6px }
 .field-block--inline { flex:1; min-width:120px }
 .field-name { color:#fff; font-weight:600; font-size:13px; margin-bottom:2px }
-.field-value { color:#dcddde; font-size:14px; white-space:pre-wrap; word-break:break-word }
+.field-value { color:#dcddde; font-size:14px }
 .embed-footer { color:#949ba4; font-size:12px; margin-top:8px; padding-top:8px; border-top:1px solid #3f4147 }
+.reply { color:#949ba4; font-size:13px; border-left:2px solid #4e5058; padding-left:8px; margin-bottom:3px }
+.fwd { border-left:3px solid #4e5058; padding:2px 0 2px 10px; margin-top:4px }
+.fwd-label { color:#949ba4; font-size:12px; margin-bottom:2px }
+.sysmsg { color:#949ba4; font-size:13px; text-align:center; margin-top:12px }
 .footer { text-align:center; color:#4e5058; font-size:12px; padding:24px; margin-top:32px; border-top:1px solid #232428 }
 """
 
@@ -458,46 +1140,45 @@ a { color:#00b0f4; text-decoration:none } a:hover { text-decoration:underline }
   <span class="ch-icon">#</span>
   <div>
     <div class="ch-name">{_esc(channel_name)}<span class="badge">{_esc(type_label)}</span></div>
-    <div class="ch-meta">Kunde: {_esc(customer_name)} &nbsp;·&nbsp; {len(messages)} Nachrichten &nbsp;·&nbsp; Export {get_now().strftime("%d.%m.%Y, %H:%M Uhr")}</div>
+    <div class="ch-meta">Kunde: {_esc(customer_name)} &nbsp;·&nbsp; {shown} Nachrichten &nbsp;·&nbsp; Export {get_now().strftime("%d.%m.%Y, %H:%M Uhr")}</div>
   </div>
 </div>
 <div class="messages">{msgs_html}</div>
-<div class="footer">InsuranceGuard v4 &nbsp;·&nbsp; Ticket-Transcript</div>
+<div class="footer">Deutsche Versicherungsgesellschaft &nbsp;·&nbsp; Ticket-Transcript</div>
 </body>
 </html>"""
 
 
-async def generate_and_save_transcript(
+def build_transcript_bytes(
     channel: discord.TextChannel, ticket_info: dict, messages: list
-) -> Optional[str]:
-    """Generiert das Transcript-HTML, speichert es, gibt die URL zurück (oder None)."""
+) -> Optional[bytes]:
+    """Erzeugt das Transcript als HTML (UTF-8). Gibt None zurück, wenn es fehlschlägt."""
     try:
         customer_id = ticket_info.get("customer_id", "")
         customer = data["customers"].get(customer_id, {})
         customer_name = customer.get("rp_name", customer_id or "Unbekannt")
-        ticket_type = ticket_info.get("type", "")
-
         html_content = generate_transcript_html(
-            channel.name, customer_name, ticket_type, messages
+            channel.name,
+            customer_name,
+            ticket_info.get("type", ""),
+            messages,
+            channel.guild,
         )
-        tid = str(uuid.uuid4())
-        path = f"transcripts/{tid}.html"
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(html_content)
-
-        if BOT_BASE_URL:
-            return f"{BOT_BASE_URL}/transcript/{tid}"
-        return None
+        return html_content.encode("utf-8")
     except Exception as e:
         logger.error(f"Transcript Generierungsfehler: {e}", exc_info=True)
         return None
+
+
+def transcript_file(channel_name: str, raw: bytes) -> discord.File:
+    return discord.File(io.BytesIO(raw), filename=f"transcript-{channel_name}.html")
 
 
 # ═══════════════════════════════════════════════════════
 #   TICKET CLOSE HELPER (DRY — inkl. Transcript)
 # ═══════════════════════════════════════════════════════
 async def close_ticket_channel(
-    interaction: discord.Interaction,
+    interaction: Optional[discord.Interaction],
     channel: discord.TextChannel,
     ticket_info: dict,
     auto_close: bool = False,
@@ -508,9 +1189,9 @@ async def close_ticket_channel(
     if interaction and not interaction.response.is_done():
         await interaction.response.defer()
 
-    # ── Nachrichten + Transcript ─────────────────────────────────────────────
-    messages = [msg async for msg in channel.history(limit=500, oldest_first=True)]
-    transcript_url = await generate_and_save_transcript(channel, ticket_info, messages)
+    # ── Alle Nachrichten + Transcript (HTML-Datei) ───────────────────────────
+    messages = [msg async for msg in channel.history(limit=None, oldest_first=True)]
+    transcript_raw = build_transcript_bytes(channel, ticket_info, messages)
 
     # ── Bearbeitungszeit berechnen ───────────────────────────────────────────
     customer_id = ticket_info.get("customer_id", "")
@@ -554,86 +1235,101 @@ async def close_ticket_channel(
         # Panel-Bearbeitungszeit direkt nach Abschluss aktualisieren
         asyncio.create_task(_do_panel_refresh())
 
-    # ── Close-Embed ──────────────────────────────────────────────────────────
+    log_channel = (
+        channel.guild.get_channel(config["log_channel_id"])
+        if config.get("log_channel_id")
+        else None
+    )
+    # Ohne Log-Kanal wird das Transcript an die Abschlussnachricht gehängt
+    transcript_in_close_msg = bool(transcript_raw) and log_channel is None
+
+    # ── Abschlussnachricht im Ticket ─────────────────────────────────────────
     title_text = (
         "Ticket automatisch geschlossen!" if auto_close else "Ticket geschlossen!"
     )
     desc_parts = [
-        "**Bearbeitung abgeschlossen.**"
-        if not auto_close
-        else "**Wegen Inaktivität automatisch geschlossen.**"
+        (
+            "**Bearbeitung abgeschlossen.**"
+            if not auto_close
+            else "**Wegen Inaktivität automatisch geschlossen.**"
+        )
     ]
-    desc_parts.append(
-        f"> Kanal wird in **5 Sekunden** gelöscht." if not auto_close else "*N/A*"
-    )
+    if not auto_close:
+        desc_parts.append("Kanal wird in **5 Sekunden** gelöscht.")
     if duration_min:
         h, m = divmod(duration_min, 60)
-        desc_parts.append(f"> <:datetime:1522597873286512777> `{h}h {m}min`")
+        desc_parts.append(f"<:datetime:1522597873286512777> `{h}h {m}min`")
 
     close_embed = dvg_embed(title_text, "\n".join(p for p in desc_parts if p))
     if not auto_close:
         close_embed.add_field(
-            name="Geschlossen von", value=f"> <:archiviert:1522597781557219448> {closer_mention}", inline=False
+            name="Geschlossen von",
+            value=f"<:archiviert:1522597781557219448> {closer_mention}",
+            inline=False,
         )
-    if transcript_url:
+    if transcript_raw:
         close_embed.add_field(
-            name="Transcript", value="> Über den Button unten abrufbar.", inline=False
+            name="Transcript",
+            value=(
+                "Als HTML-Datei angehängt."
+                if transcript_in_close_msg
+                else "Als HTML-Datei im Log-Kanal abgelegt."
+            ),
+            inline=False,
         )
-        close_embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
+    else:
+        close_embed.add_field(
+            name="Transcript",
+            value="Konnte nicht erstellt werden.",
+            inline=False,
+        )
 
-    view = discord.ui.View()
-    if transcript_url:
-        view.add_item(
-            discord.ui.Button(label="Transcript anzeigen", url=transcript_url)
-        )
+    close_kwargs = {}
+    if transcript_in_close_msg:
+        tf = transcript_file(channel.name, transcript_raw)
+        close_kwargs = {**ev(close_embed, file=tf.filename), "file": tf}
+    else:
+        close_kwargs = ev(close_embed)
 
     if interaction and interaction.response.is_done():
-        if transcript_url:
-            await interaction.followup.send(embed=close_embed, view=view)
-        else:
-            await interaction.followup.send(embed=close_embed)
+        await interaction.followup.send(**close_kwargs)
     else:
-        if transcript_url:
-            await channel.send(embed=close_embed, view=view)
-        else:
-            await channel.send(embed=close_embed)
+        await channel.send(**close_kwargs)
 
     # ── Log-Kanal ────────────────────────────────────────────────────────────
     log_e = dvg_embed(
         f"Ticket geschlossen{'  –  Inaktivität' if auto_close else ''}",
-        f"> Dieses Ticket wurde erfolgreich geschlossen. Die zugehörigen Details sind nachfolgend aufgeführt.",
+        "Dieses Ticket wurde erfolgreich geschlossen. Die zugehörigen Details sind nachfolgend aufgeführt.",
     )
     log_e.add_field(
-        name="Kanal", 
-        value=f"> <:channel:1522597774095286313> `{channel.name}`", 
-        inline=False
-    )
-    log_e.add_field(
-        name="Kunden-ID",
-        value=f"> <:id:1522597735205830666> `{customer_id}`",
+        name="Kanal",
+        value=f"<:channel:1522597774095286313> `{channel.name}`",
         inline=False,
     )
     log_e.add_field(
-        name="Geschlossen von", 
-        value=f"> <:archiviert:1522597781557219448> {closer_mention}", 
-        inline=True
+        name="Kunden-ID",
+        value=f"<:id:1522597735205830666> `{customer_id}`",
+        inline=False,
     )
-    log_e.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
+    log_e.add_field(
+        name="Geschlossen von",
+        value=f"<:archiviert:1522597781557219448> {closer_mention}",
+        inline=True,
+    )
     if duration_min:
         h, m = divmod(duration_min, 60)
-        log_e.add_field(name="Bearbeitungsdauer", value=f"> <:datetime:1522597873286512777> `{h}h {m}min`", inline=True)
-
-    if transcript_url:
-        log_view = discord.ui.View()
-        log_view.add_item(
-            discord.ui.Button(label="Transcript anzeigen", url=transcript_url)
+        log_e.add_field(
+            name="Bearbeitungsdauer",
+            value=f"<:datetime:1522597873286512777> `{h}h {m}min`",
+            inline=True,
         )
-        await send_to_log_channel(channel.guild, log_e, view=log_view)
-    else:
-        await send_to_log_channel(channel.guild, log_e)
-        
-    log_e.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-    
+    log_file = (
+        transcript_file(channel.name, transcript_raw)
+        if (transcript_raw and log_channel is not None)
+        else None
+    )
+    await send_to_log_channel(channel.guild, log_e, file=log_file)
+
     # ── Daten bereinigen ─────────────────────────────────────────────────────
     ch_key = str(channel.id)
     if ch_key in data.get("ticket_channels", {}):
@@ -647,7 +1343,8 @@ async def close_ticket_channel(
             "customer_id": customer_id,
             "channel_name": channel.name,
             "auto_close": auto_close,
-            "transcript_url": transcript_url or "—",
+            "transcript": "HTML-Datei" if transcript_raw else "—",
+            "nachrichten": len(messages),
         },
     )
 
@@ -681,7 +1378,7 @@ async def _send_inactivity_warning(
         pings.append(cust_user.mention)
 
     auto_close_time = get_now() + timedelta(hours=8)
-    warn_embed = discord.Embed(
+    warn_embed = DEmbed(
         title="Inaktivitätswarnung",
         description=(
             "> Dieses Ticket ist seit **16 Stunden** inaktiv.\n"
@@ -696,13 +1393,13 @@ async def _send_inactivity_warning(
         value=f"> `{auto_close_time.strftime('%d.%m.%Y, %H:%M Uhr')}`",
         inline=False,
     )
-    warn_embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-    warn_embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
 
     await channel.send(
-        content=" ".join(pings) if pings else None,
-        embed=warn_embed,
-        view=InaktivitätsWarnView(),
+        **ev(
+            warn_embed,
+            view=InaktivitätsWarnView(),
+            ping=" ".join(pings) if pings else None,
+        )
     )
 
     data["ticket_channels"][ch_id_str]["inactivity_warned_at"] = get_now().isoformat()
@@ -901,9 +1598,8 @@ async def send_invoice_due_dm(guild: discord.Guild, invoice_id: str, inv: dict):
         value=f"> HBpay: `{customer.get('hbpay_nummer', '—')}`",
         inline=False,
     )
-    dm.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
     try:
-        await member.send(embed=dm)
+        await member.send(**ev(dm))
         data["invoices"][invoice_id]["dm_reminder_sent"] = True
         save_data(data)
         logger.info(f"Zahlungserinnerung per DM gesendet: {invoice_id} -> {member}")
@@ -955,8 +1651,9 @@ def is_firmenkontorolle(interaction: discord.Interaction) -> bool:
 def build_error_embed(
     title: str, description: str, needed_permission: Optional[str] = None
 ) -> discord.Embed:
-    e = dvg_embed(title, f"> {description}")
-    e.set_author(name=f"Berechtigungsprüfung", icon_url=AUTOMOD_ICON)
+    e = dvg_embed(title, description)
+    e.color = discord.Color(COLOR_ERROR)  # roter Container ohne Fußzeile
+    e.timestamp = None
     if needed_permission:
         e.add_field(
             name="Erforderliche Berechtigung",
@@ -972,7 +1669,7 @@ def build_error_embed(
 def build_kundenakte_embed(customer_id: str, customer: dict) -> discord.Embed:
     ins_types = get_insurance_types()
     total_price = customer.get("total_monthly_price", 0.0)
-    embed = dvg_embed("Versicherungsakte")
+    embed = dvg_embed("Versicherungsakte", big=True)
     embed.add_field(
         name="Versicherungsnehmer",
         value=f"> <:member:1522597880437932112> `{customer['rp_name']}`\n> <:id:1522597735205830666> `{customer_id}`",
@@ -997,8 +1694,6 @@ def build_kundenakte_embed(customer_id: str, customer: dict) -> discord.Embed:
         value=f"> <:einzahlung:1522597871051079710> `{total_price:,.2f}€/Monat` zzgl. 19% Steuern",
         inline=False,
     )
-    embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-    embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
     return embed
 
 
@@ -1013,14 +1708,15 @@ async def update_forum_thread_embed(
         if not thread:
             thread = await guild.fetch_channel(thread_id)
         async for msg in thread.history(limit=5, oldest_first=True):
-            if (
-                msg.author.id == (guild.me.id if guild.me else bot.user.id)
-                and msg.embeds
+            if msg.author.id == (guild.me.id if guild.me else bot.user.id) and (
+                msg.embeds or msg.flags.components_v2
             ):
                 uid = customer.get("discord_user_id")
                 ping = f"<@{uid}>" if uid else ""
                 await msg.edit(
-                    content=ping, embed=build_kundenakte_embed(customer_id, customer)
+                    **v2_edit(
+                        msg, build_kundenakte_embed(customer_id, customer), ping=ping
+                    )
                 )
                 return
     except Exception as e:
@@ -1060,7 +1756,7 @@ async def update_customer_thread_backup(guild: discord.Guild, customer_id: str):
         buf.seek(0)
         file = discord.File(buf, filename=f"akte_{customer_id}.json")
 
-        embed = discord.Embed(
+        embed = DEmbed(
             title="Aktuelle Kundendaten",
             description=f"> Diese Datei enthält den aktuellen Datenstand der Akte `{customer_id}`.\n> Sie wird bei jeder Änderung automatisch aktualisiert.",
             color=EMBED_COLOR,
@@ -1074,9 +1770,8 @@ async def update_customer_thread_backup(guild: discord.Guild, customer_id: str):
             value=f"> {get_now().strftime('%d.%m.%Y, %H:%M Uhr')}",
             inline=True,
         )
-        embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
 
-        msg = await thread.send(embed=embed, file=file)
+        msg = await thread.send(file=file, **ev(embed, file=file.filename))
         data["customers"][customer_id]["backup_message_id"] = msg.id
         save_data(data)
     except Exception as e:
@@ -1111,7 +1806,6 @@ MODUL_COMMANDS = {
         "add",
         "remove",
         "schaden-historie",
-        "portal-zugang",
         "blacklist-add",
         "blacklist-remove",
         "blacklist-liste",
@@ -1183,16 +1877,16 @@ async def on_ready():
         await guild_sync(guild, aktive)
 
     # Persistent Views registrieren
-    bot.add_view(KundenkontaktView())
-    bot.add_view(SchadensmeldungView())
-    bot.add_view(TicketCloseView(0, ""))  # Legacy-Compat für bestehende Tickets
-    bot.add_view(SchadensmeldungTicketView())  # Neue Schadensmeldungs-Tickets
-    bot.add_view(KundenkontaktTicketView())  # Neue Kundenkontakt-Tickets
-    bot.add_view(
+    register_persistent(KundenkontaktView())
+    register_persistent(SchadensmeldungView())
+    register_persistent(TicketCloseView(0, ""))  # Legacy-Compat für bestehende Tickets
+    register_persistent(SchadensmeldungTicketView())  # Neue Schadensmeldungs-Tickets
+    register_persistent(KundenkontaktTicketView())  # Neue Kundenkontakt-Tickets
+    register_persistent(
         CloseRequestView()
     )  # Schließanfrage: Annehmen/Ablehnen durch den Kunden
-    bot.add_view(InaktivitätsWarnView())  # Inaktivitätswarnung
-    bot.add_view(AuszahlungActionView("dummy", "dummy", 0.0))
+    register_persistent(InaktivitätsWarnView())  # Inaktivitätswarnung
+    register_persistent(AuszahlungActionView("dummy", "dummy", 0.0))
 
     # Verwaiste ticket_channels-Einträge bereinigen (Channel bereits gelöscht)
     stale_keys = []
@@ -1253,11 +1947,13 @@ async def ping(interaction: discord.Interaction):
     status_val = (
         f"> **`{ms} ms`** — Ausgezeichnete Verbindung!"
         if ms < 100
-        else f"> **`{ms} ms`** — Stabile Verbindung!"
-        if ms < 200
-        else f"> **`{ms} ms`** — Schlechte Verbindung!"
+        else (
+            f"> **`{ms} ms`** — Stabile Verbindung!"
+            if ms < 200
+            else f"> **`{ms} ms`** — Schlechte Verbindung!"
+        )
     )
-    embed = discord.Embed(
+    embed = DEmbed(
         title="Systemstatus InsuranceGuard v4", color=color, timestamp=get_now()
     )
     embed.add_field(name="Verbindung", value=status_val, inline=False)
@@ -1271,9 +1967,7 @@ async def ping(interaction: discord.Interaction):
         value=f"> {get_now().strftime('%d.%m.%Y, %H:%M Uhr')}",
         inline=False,
     )
-    embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-    embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(ephemeral=True, **ev(embed))
 
 
 # ═══════════════════════════════════════════════════════
@@ -1292,12 +1986,14 @@ async def ping(interaction: discord.Interaction):
 async def modul_cmd(interaction: discord.Interaction, aktion: str):
     if not is_admin(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!",
-                "Nur Administratoren können Module verwalten.",
-                "Administrator",
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!",
+                    "Nur Administratoren können Module verwalten.",
+                    "Administrator",
+                )
+            ),
         )
         return
     await interaction.response.defer(ephemeral=True)
@@ -1306,7 +2002,7 @@ async def modul_cmd(interaction: discord.Interaction, aktion: str):
     aktive = get_aktive_module(interaction.guild_id)
     synced = await guild_sync(interaction.guild, aktive)
     icon = "" if aktiv else ""
-    e = discord.Embed(
+    e = DEmbed(
         title="Modul aktiviert!" if aktiv else "Modul deaktiviert!",
         description=(
             f"> **Versicherungsfirma** wurde {'aktiviert' if aktiv else 'deaktiviert'}!\n"
@@ -1323,9 +2019,7 @@ async def modul_cmd(interaction: discord.Interaction, aktion: str):
         value="> Sollten die Befehle nicht sofort erscheinen, lade die Discord-App neu.",
         inline=False,
     )
-    e.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-    e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.followup.send(embed=e, ephemeral=True)
+    await interaction.followup.send(ephemeral=True, **ev(e))
     add_log_entry(
         "MODUL_GEAENDERT",
         interaction.user.id,
@@ -1342,12 +2036,14 @@ async def modul_cmd(interaction: discord.Interaction, aktion: str):
 async def backup_download(interaction: discord.Interaction):
     if not is_leitungsebene(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!",
-                "Nur die Leitungsebene kann Backups herunterladen.",
-                "Leitungsebene",
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!",
+                    "Nur die Leitungsebene kann Backups herunterladen.",
+                    "Leitungsebene",
+                )
+            ),
         )
         return
     await interaction.response.defer(ephemeral=True)
@@ -1358,10 +2054,18 @@ async def backup_download(interaction: discord.Interaction):
             buf, filename=f"insurance_backup_{get_now().strftime('%Y%m%d_%H%M%S')}.zip"
         )
         await interaction.followup.send(
-            "## Vollständiger Datenbank-Export", file=file, ephemeral=True
+            file=file,
+            ephemeral=True,
+            **ev(
+                dvg_embed(
+                    "Vollständiger Datenbank-Export",
+                    "Das Backup wurde als ZIP-Datei angehängt.",
+                ),
+                file=file.filename,
+            ),
         )
     except Exception as e:
-        await interaction.followup.send(f" Fehler: {e}", ephemeral=True)
+        await interaction.followup.send(ephemeral=True, **ev_text(f" Fehler: {e}"))
 
 
 @bot.tree.command(
@@ -1371,20 +2075,24 @@ async def backup_download(interaction: discord.Interaction):
 async def reload_backup(interaction: discord.Interaction, datei: discord.Attachment):
     if not is_leitungsebene(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!",
-                "Nur die Leitungsebene kann Backups wiederherstellen.",
-                "Leitungsebene",
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!",
+                    "Nur die Leitungsebene kann Backups wiederherstellen.",
+                    "Leitungsebene",
+                )
+            ),
         )
         return
     if not datei.filename.endswith(".json"):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Falscher Dateityp!", "Nur `.json` Dateien sind erlaubt."
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Falscher Dateityp!", "Nur `.json` Dateien sind erlaubt."
+                )
+            ),
         )
         return
     await interaction.response.defer(ephemeral=True)
@@ -1400,19 +2108,21 @@ async def reload_backup(interaction: discord.Interaction, datei: discord.Attachm
                     data[key] = {}
             save_data(data)
             await interaction.followup.send(
-                " `insurance_data.json` wiederhergestellt.", ephemeral=True
+                ephemeral=True, **ev_text(" `insurance_data.json` wiederhergestellt.")
             )
         elif "log_channel_id" in json_obj or "insurance_types" in json_obj:
             global config
             config = json_obj
             save_config(config)
             await interaction.followup.send(
-                " `bot_config.json` wiederhergestellt.", ephemeral=True
+                ephemeral=True, **ev_text(" `bot_config.json` wiederhergestellt.")
             )
         else:
-            await interaction.followup.send(" Unbekanntes Dateiformat.", ephemeral=True)
+            await interaction.followup.send(
+                ephemeral=True, **ev_text(" Unbekanntes Dateiformat.")
+            )
     except Exception as e:
-        await interaction.followup.send(f" Fehler: {e}", ephemeral=True)
+        await interaction.followup.send(ephemeral=True, **ev_text(f" Fehler: {e}"))
 
 
 # ═══════════════════════════════════════════════════════
@@ -1426,12 +2136,14 @@ async def reload_backup(interaction: discord.Interaction, datei: discord.Attachm
 async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!",
-                "Nur Mitarbeiter können die Kundensuche verwenden.",
-                "Mitarbeiter",
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!",
+                    "Nur Mitarbeiter können die Kundensuche verwenden.",
+                    "Mitarbeiter",
+                )
+            ),
         )
         return
     await interaction.response.defer(ephemeral=True)
@@ -1445,7 +2157,7 @@ async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
             or q in c.get("hbpay_nummer", "").lower()
         ]
         if not treffer:
-            embed = discord.Embed(
+            embed = DEmbed(
                 title="Keine Suchergebnisse!",
                 description=f"> Für `{suchbegriff}` wurden keine Kunden gefunden.",
                 color=EMBED_COLOR,
@@ -1456,11 +2168,10 @@ async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
                 value="> `-` Kunden-ID: `VN-26123456`\n> `-` RP-Name: `Max Mustermann`\n> `-` Kartennummer",
                 inline=False,
             )
-            embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.followup.send(ephemeral=True, **ev(embed))
             return
 
-        embed = discord.Embed(
+        embed = DEmbed(
             title="Suchergebnisse",
             description=f"> <:2125search:1522597748631801861> `{suchbegriff}`\n> <:3084channelsandroles:1522597765794758810> `{len(treffer)}` Treffer",
             color=EMBED_COLOR,
@@ -1494,13 +2205,11 @@ async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
                 ),
                 inline=False,
             )
-        embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-        embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(ephemeral=True, **ev(embed))
     except Exception as e:
         logger.error(f"Kundensuche Fehler: {e}", exc_info=True)
         await interaction.followup.send(
-            embed=build_error_embed("Fehler!", str(e)), ephemeral=True
+            ephemeral=True, **ev(build_error_embed("Fehler!", str(e)))
         )
 
 
@@ -1529,7 +2238,7 @@ class KündigungSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         view = self.view
-        for item in view.children:
+        for item in view.controls:
             if isinstance(item, discord.ui.Button):
                 item.disabled = False
         ins_types = get_insurance_types()
@@ -1548,14 +2257,10 @@ class KündigungSelect(discord.ui.Select):
             value=f"> Wegfall: `-{wegfall:,.2f}€`\n> Neuer Beitrag: **`{neu_total:,.2f}€`**",
             inline=False,
         )
-        e.set_footer(
-            text=FOOTER_TEXT,
-            icon_url=FOOTER_ICON,
-        )
-        await interaction.response.edit_message(embed=e, view=view)
+        await interaction.response.edit_message(**ev(e, view=view))
 
 
-class KündigungView(discord.ui.View):
+class KündigungView(EView):
     def __init__(self, customer_id: str, customer: dict):
         super().__init__(timeout=120)
         self.confirmed = False
@@ -1584,27 +2289,31 @@ class KündigungView(discord.ui.View):
 async def versicherung_kündigen(interaction: discord.Interaction, customer_id: str):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!",
-                "Nur Mitarbeiter können Versicherungen kündigen.",
-                "Mitarbeiter",
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!",
+                    "Nur Mitarbeiter können Versicherungen kündigen.",
+                    "Mitarbeiter",
+                )
+            ),
         )
         return
     if customer_id not in data["customers"]:
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Nicht gefunden!", f"Keine Kundenakte mit ID `{customer_id}`."
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Nicht gefunden!", f"Keine Kundenakte mit ID `{customer_id}`."
+                )
+            ),
         )
         return
     customer = data["customers"][customer_id]
     if not customer.get("versicherungen"):
         await interaction.response.send_message(
-            embed=dvg_embed("Keine Versicherungen!", "> Keine aktiven Versicherungen."),
             ephemeral=True,
+            **ev(dvg_embed("Keine Versicherungen!", "> Keine aktiven Versicherungen.")),
         )
         return
 
@@ -1625,9 +2334,11 @@ async def versicherung_kündigen(interaction: discord.Interaction, customer_id: 
         )
         e.add_field(
             name="Verbleibend",
-            value=f"> `{fehlende}` weiterer Monatsbeitrag"
-            if singular
-            else f"> `{fehlende}` weitere Monatsbeiträge",
+            value=(
+                f"> `{fehlende}` weiterer Monatsbeitrag"
+                if singular
+                else f"> `{fehlende}` weitere Monatsbeiträge"
+            ),
             inline=True,
         )
         e.add_field(
@@ -1635,7 +2346,7 @@ async def versicherung_kündigen(interaction: discord.Interaction, customer_id: 
             value=f"> {customer['rp_name']} (`{customer_id}`)",
             inline=False,
         )
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.response.send_message(ephemeral=True, **ev(e))
         return
 
     ins_types = get_insurance_types()
@@ -1658,13 +2369,12 @@ async def versicherung_kündigen(interaction: discord.Interaction, customer_id: 
         value=f">  **`{customer.get('total_monthly_price', 0):,.2f}€`**",
         inline=False,
     )
-    e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.response.send_message(embed=e, view=view, ephemeral=True)
+    await interaction.response.send_message(ephemeral=True, **ev(e, view=view))
     await view.wait()
 
     if not view.confirmed:
         await interaction.edit_original_response(
-            embed=dvg_embed("Kündigung abgebrochen."), view=None
+            **ev(dvg_embed("Kündigung abgebrochen."))
         )
         return
 
@@ -1726,8 +2436,7 @@ async def versicherung_kündigen(interaction: discord.Interaction, customer_id: 
                     value=f"> {interaction.user.mention}",
                     inline=True,
                 )
-                v.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-                await thread.send(embed=v)
+                await thread.send(**ev(v))
         except Exception as e:
             logger.error(f"Thread-Eintrag Fehler: {e}")
 
@@ -1743,9 +2452,8 @@ async def versicherung_kündigen(interaction: discord.Interaction, customer_id: 
         dm.add_field(
             name="Neuer Monatsbeitrag", value=f"> `{new_total:,.2f}€`", inline=False
         )
-        dm.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
         try:
-            await member.send(embed=dm)
+            await member.send(**ev(dm))
         except discord.Forbidden:
             pass
 
@@ -1773,7 +2481,6 @@ async def versicherung_kündigen(interaction: discord.Interaction, customer_id: 
     log_e.add_field(
         name="Durchgeführt von", value=f"> {interaction.user.mention}", inline=True
     )
-    log_e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
     await send_to_log_channel(interaction.guild, log_e)
 
     s = dvg_embed(
@@ -1792,8 +2499,7 @@ async def versicherung_kündigen(interaction: discord.Interaction, customer_id: 
     s.add_field(
         name="Neuer Monatsbeitrag", value=f">  **`{new_total:,.2f}€`**", inline=False
     )
-    s.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.edit_original_response(embed=s, view=None)
+    await interaction.edit_original_response(**ev(s))
 
 
 # ═══════════════════════════════════════════════════════
@@ -1814,22 +2520,26 @@ async def rechnungen_Übersicht(
 ):
     if not is_leitungsebene(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!",
-                "Nur die Leitungsebene kann Rechnungsübersichten einsehen.",
-                "Leitungsebene",
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!",
+                    "Nur die Leitungsebene kann Rechnungsübersichten einsehen.",
+                    "Leitungsebene",
+                )
+            ),
         )
         return
     await interaction.response.defer(ephemeral=True)
     try:
         if customer_id and customer_id not in data["customers"]:
             await interaction.followup.send(
-                embed=build_error_embed(
-                    "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
+                    )
+                ),
             )
             return
         gefiltert = {
@@ -1840,15 +2550,15 @@ async def rechnungen_Übersicht(
         }
         if not gefiltert:
             await interaction.followup.send(
-                embed=dvg_embed("Keine Rechnungen", "> Keine Rechnungen gefunden."),
                 ephemeral=True,
+                **ev(dvg_embed("Keine Rechnungen", "> Keine Rechnungen gefunden.")),
             )
             return
 
         sorted_inv = sorted(
             gefiltert.items(), key=lambda x: x[1].get("created_at", ""), reverse=True
         )
-        embed = discord.Embed(
+        embed = DEmbed(
             title="Rechnungsübersicht",
             description=(
                 (
@@ -1889,12 +2599,11 @@ async def rechnungen_Übersicht(
         embed.add_field(
             name="Offene Summe", value=f"> **`{total_offen:,.2f}€`**", inline=False
         )
-        embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(ephemeral=True, **ev(embed))
     except Exception as e:
         logger.error(f"Rechnungsübersicht Fehler: {e}", exc_info=True)
         await interaction.followup.send(
-            embed=build_error_embed("Fehler!", str(e)), ephemeral=True
+            ephemeral=True, **ev(build_error_embed("Fehler!", str(e)))
         )
 
 
@@ -1909,26 +2618,27 @@ async def rechnungen_Übersicht(
 async def set_steuer(interaction: discord.Interaction, prozent: float):
     if not is_admin(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
+                )
+            ),
         )
         return
     if not (0 <= prozent <= 100):
         await interaction.response.send_message(
-            embed=build_error_embed("Ungültiger Wert!", "0–100."), ephemeral=True
+            ephemeral=True, **ev(build_error_embed("Ungültiger Wert!", "0–100."))
         )
         return
     config["steuer_prozent"] = prozent
     save_config(config)
-    e = discord.Embed(
+    e = DEmbed(
         title="Steuersatz aktualisiert!",
         description=f"> Neuer Steuersatz: **`{prozent}%`**",
         color=EMBED_COLOR,
     )
-    e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.response.send_message(embed=e, ephemeral=True)
+    await interaction.response.send_message(ephemeral=True, **ev(e))
     add_log_entry(
         "STEUERSATZ_GEAENDERT", interaction.user.id, {"neuer_steuersatz": prozent}
     )
@@ -1953,18 +2663,20 @@ async def add_versicherung(
 ):
     if not is_admin(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
+                )
+            ),
         )
         return
     if name in config["insurance_types"]:
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Bereits vorhanden!", f"`{name}` existiert bereits."
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed("Bereits vorhanden!", f"`{name}` existiert bereits.")
+            ),
         )
         return
     role = rollenname if rollenname else name
@@ -1980,8 +2692,7 @@ async def add_versicherung(
     e.add_field(name="Preis", value=f"> `{preis:,.2f}€/Monat`", inline=True)
     e.add_field(name="Limit", value=f"> `{auszahlungslimit:,.2f}€`", inline=True)
     e.add_field(name="Rolle", value=f"> `{role}`", inline=True)
-    e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.response.send_message(embed=e, ephemeral=True)
+    await interaction.response.send_message(ephemeral=True, **ev(e))
     add_log_entry(
         "VERSICHERUNG_HINZUGEFUEGT",
         interaction.user.id,
@@ -2008,16 +2719,18 @@ async def edit_versicherung(
 ):
     if not is_admin(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
+                )
+            ),
         )
         return
     if name not in config["insurance_types"]:
         await interaction.response.send_message(
-            embed=build_error_embed("Nicht gefunden!", f"Keine Versicherung `{name}`."),
             ephemeral=True,
+            **ev(build_error_embed("Nicht gefunden!", f"Keine Versicherung `{name}`.")),
         )
         return
     changes = []
@@ -2032,17 +2745,16 @@ async def edit_versicherung(
         changes.append(f"Status: `{'Aktiv' if aktiviert else 'Deaktiviert'}`")
     if not changes:
         await interaction.response.send_message(
-            "Keine Änderungen angegeben.", ephemeral=True
+            ephemeral=True, **ev_text("Keine Änderungen angegeben.")
         )
         return
     save_config(config)
-    e = discord.Embed(
+    e = DEmbed(
         title=f"Versicherung `{name}` aktualisiert!",
         description="\n".join(f"> {c}" for c in changes),
         color=EMBED_COLOR,
     )
-    e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.response.send_message(embed=e, ephemeral=True)
+    await interaction.response.send_message(ephemeral=True, **ev(e))
 
 
 @bot.tree.command(
@@ -2052,10 +2764,12 @@ async def edit_versicherung(
 async def list_versicherungen(interaction: discord.Interaction):
     if not is_admin(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
+                )
+            ),
         )
         return
     e = dvg_embed("Versicherungskonfiguration")
@@ -2071,8 +2785,7 @@ async def list_versicherungen(interaction: discord.Interaction):
             value=f"> Preis: `{v['price']:,.2f}€/Mo`\n> Limit: `{v['auszahlung_limit']:,.2f}€`\n> Rolle: `{v['role']}`",
             inline=True,
         )
-    e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.response.send_message(embed=e, ephemeral=True)
+    await interaction.response.send_message(ephemeral=True, **ev(e))
 
 
 @bot.tree.command(
@@ -2100,10 +2813,12 @@ async def set_channels(
 ):
     if not is_admin(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
+                )
+            ),
         )
         return
 
@@ -2160,8 +2875,7 @@ async def set_channels(
             value=cat(config.get("schadensmeldung_category_id")),
             inline=True,
         )
-        e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.response.send_message(ephemeral=True, **ev(e))
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -2201,9 +2915,8 @@ async def set_channels(
                 value="> `-` Gültige **Kunden-ID** erforderlich!\n> `-` Kontaktgrund **detailliert** beschreiben!\n> `-` Nur für **Mitarbeiter** und **Leitungsebene**!\n> `-` Pro Mitarbeiter nur **ein aktives Ticket** gleichzeitig!",
                 inline=False,
             )
-            embed_kk.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-            embed_kk.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-            await kundenkontakt_panel.send(embed=embed_kk, view=KundenkontaktView())
+            embed_kk.big = True
+            await kundenkontakt_panel.send(**ev(embed_kk, view=KundenkontaktView()))
             changes.append(f"KK-Panel: {kundenkontakt_panel.mention}")
             panel_results.append(f" Kundenkontakt-Panel gesendet")
         except Exception as ex:
@@ -2212,39 +2925,8 @@ async def set_channels(
     if schadensmeldung_panel:
         try:
             config["schadensmeldung_channel_id"] = schadensmeldung_panel.id
-            embed_sm = dvg_embed(
-                "Schadensmeldung",
-                "Liebe Versicherungsnehmer:innen,\n> hier können sie Schadensmeldungen einreichen.",
-            )
-            embed_sm.add_field(
-                name="Wie funktioniert das System?",
-                value="> 1. Klicken Sie auf den Button unten!\n> 2. Geben Sie Ihre Kunden-ID ein!\n> 3. Füllen Sie das Formular aus!\n> 4. Ein Schadensfall-Ticket wird erstellt!",
-                inline=False,
-            )
-            embed_sm.add_field(
-                name="Welche Angaben sind erforderlich?",
-                value="> `-` **Kunden-ID**\n> `-` **Geschädigter** (RP-Name)\n> `-` **Täter** (RP-Name)\n> `-` **Vorfallbeschreibung**\n> `-` **Rechnung/Nachweis**",
-                inline=False,
-            )
-            # Voraussichtliche Bearbeitungszeit aus ticket_stats berechnen
-            sm_stats = [
-                s
-                for s in data.get("ticket_stats", [])
-                if s.get("type") == "schadensmeldung" and s.get("duration_minutes")
-            ]
-            if sm_stats:
-                avg_m = int(
-                    sum(s["duration_minutes"] for s in sm_stats) / len(sm_stats)
-                )
-                h, m = divmod(avg_m, 60)
-                avg_tx = f"`{h}h {m}min`" if h else f"`{m} Minuten`"
-                bearbzeit = f"> Voraussichtliche Bearbeitungszeit: {avg_tx}\n> Basierend auf {len(sm_stats)} abgeschlossenen Vorgängen."
-            else:
-                bearbzeit = "> Voraussichtliche Bearbeitungszeit: *N/A*"
-            embed_sm.add_field(name="Bearbeitungszeit", value=bearbzeit, inline=False)
-            embed_sm.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-            embed_sm.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-            await schadensmeldung_panel.send(embed=embed_sm, view=SchadensmeldungView())
+            embed_sm = build_schadensmeldung_panel_embed()
+            await schadensmeldung_panel.send(**ev(embed_sm, view=SchadensmeldungView()))
             changes.append(f"SM-Panel: {schadensmeldung_panel.mention}")
             panel_results.append(f" Schadensmeldungs-Panel gesendet")
         except Exception as ex:
@@ -2265,8 +2947,7 @@ async def set_channels(
             value="\n".join(f"> {r}" for r in panel_results),
             inline=False,
         )
-    e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.followup.send(embed=e, ephemeral=True)
+    await interaction.followup.send(ephemeral=True, **ev(e))
 
 
 # ═══════════════════════════════════════════════════════
@@ -2293,24 +2974,25 @@ class InsuranceSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         view = self.view
-        for item in view.children:
+        for item in view.controls:
             if isinstance(item, discord.ui.Button):
                 item.disabled = False
         ins_types = get_insurance_types()
         total = sum(ins_types[ins]["price"] for ins in self.values)
         preview = "\n".join(
-            f"> <:1821serversfolder:1522597744030777405> {ins} — {ins_types[ins]['price']:,.2f}€" for ins in self.values
+            f"> <:1821serversfolder:1522597744030777405> {ins} — {ins_types[ins]['price']:,.2f}€"
+            for ins in self.values
         )
-        e = discord.Embed(
+        e = DEmbed(
             title="Versicherungen ausgewählt!",
             description=f"{preview}\n\n**Gesamtbeitrag:** `{total:,.2f}€`",
             color=EMBED_COLOR,
         )
         e.set_footer(text="Klicken Sie auf 'Kundenakte erstellen', um fortzufahren.")
-        await interaction.response.edit_message(embed=e, view=view)
+        await interaction.response.edit_message(**ev(e, view=view))
 
 
-class InsuranceView(discord.ui.View):
+class InsuranceView(EView):
     def __init__(self):
         super().__init__(timeout=180)
         self.confirmed = False
@@ -2352,12 +3034,12 @@ class AddInsuranceSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         view = self.view
-        for item in view.children:
+        for item in view.controls:
             if isinstance(item, discord.ui.Button):
                 item.disabled = False
         ins_types = get_insurance_types()
         total = sum(ins_types[ins]["price"] for ins in self.values)
-        e = discord.Embed(
+        e = DEmbed(
             title="Neue Versicherungen ausgewählt!",
             description="\n".join(
                 f"> `-` {ins} — {ins_types[ins]['price']:,.2f}€" for ins in self.values
@@ -2365,10 +3047,10 @@ class AddInsuranceSelect(discord.ui.Select):
             + f"\n\n**Zusätzlicher Beitrag:** `{total:,.2f}€`",
             color=EMBED_COLOR,
         )
-        await interaction.response.edit_message(embed=e, view=view)
+        await interaction.response.edit_message(**ev(e, view=view))
 
 
-class AddInsuranceView(discord.ui.View):
+class AddInsuranceView(EView):
     def __init__(self, existing_insurances: list):
         super().__init__(timeout=180)
         self.confirmed = False
@@ -2405,10 +3087,14 @@ async def create_customer(
 ):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter / Leitungsebene"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!",
+                    "Nur Mitarbeiter.",
+                    "Mitarbeiter / Leitungsebene",
+                )
+            ),
         )
         return
     view = InsuranceView()
@@ -2417,19 +3103,15 @@ async def create_customer(
         "> Bitte wählen Sie die gewünschten Versicherungen aus dem Dropdown-Menü.",
     )
     await interaction.response.send_message(
-        embed=select_embed, view=view, ephemeral=True
+        ephemeral=True, **ev(select_embed, view=view)
     )
     await view.wait()
     if not view.confirmed:
-        await interaction.edit_original_response(
-            embed=dvg_embed("Zeitüberschreitung!"), view=None
-        )
+        await interaction.edit_original_response(**ev(dvg_embed("Zeitüberschreitung!")))
         return
-    ins_list = view.children[0].values
+    ins_list = view.controls[0].values
     if not ins_list:
-        await interaction.edit_original_response(
-            embed=dvg_embed("Keine Auswahl!"), view=None
-        )
+        await interaction.edit_original_response(**ev(dvg_embed("Keine Auswahl!")))
         return
 
     ins_types = get_insurance_types()
@@ -2450,7 +3132,7 @@ async def create_customer(
         }
         embed = build_kundenakte_embed(customer_id, customer_data)
         thread = await forum_channel.create_thread(
-            name=f" {customer_id} | {rp_name}", content=user.mention, embed=embed
+            name=f" {customer_id} | {rp_name}", **ev(embed, ping=user.mention)
         )
         customer_data["thread_id"] = thread.thread.id
         data["customers"][customer_id] = customer_data
@@ -2471,29 +3153,12 @@ async def create_customer(
             )
         await user.add_roles(kunden_role)
 
-        # ── Portal-Token automatisch erstellen und per DM senden ────────────────
-        token = generate_portal_token(customer_id)
-        portal_url = f"{BOT_BASE_URL}/portal/{token}" if BOT_BASE_URL else None
-
+        # ── Willkommensnachricht per DM ─────────────────────────────────────────
         dm_embed = build_kundenakte_embed(customer_id, customer_data)
         dm_embed.title = "Willkommen der DVG!"
         dm_embed.description = "Ihre Versicherungsakte wurde erfolgreich angelegt."
-        if portal_url:
-            dm_embed.add_field(
-                name="Kundenportal",
-                value="> Über den Button unten gelangen Sie jederzeit zu Ihrer persönlichen Versicherungsübersicht.",
-                inline=False,
-            )
-        dm_embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-        dm_view = discord.ui.View()
-        if portal_url:
-            dm_view.add_item(
-                discord.ui.Button(label="Zum Kundenportal", url=portal_url)
-            )
         try:
-            dm_msg = await user.send(
-                embed=dm_embed, view=dm_view if portal_url else None
-            )
+            dm_msg = await user.send(**ev(dm_embed))
             customer_data["dm_message_ids"] = [dm_msg.id]
         except discord.Forbidden:
             pass
@@ -2513,35 +3178,36 @@ async def create_customer(
         )
         await update_customer_thread_backup(interaction.guild, customer_id)
 
-        log_e = dvg_embed("Neue Kundenakte erstellt!",
-                         description="Diese Kundenakte wurde soeben angelegt. Eine Übersicht der wichtigsten Informationen finden Sie nachfolgend aufgelistet.")
+        log_e = dvg_embed(
+            "Neue Kundenakte erstellt!",
+            description="Diese Kundenakte wurde soeben angelegt. Eine Übersicht der wichtigsten Informationen finden Sie nachfolgend aufgelistet.",
+        )
         log_e.add_field(
             name="Versicherungsnehmer",
             value=f"> <:member:1522597880437932112> `{rp_name}`\n> <:id:1522597735205830666> `{customer_id}`\n> <:6509addguild:1522597829917413396> `{total_price:,.2f}€/Monat`",
             inline=False,
         )
         log_e.add_field(
-            name="Aussteller", value=f"> <:mitarbeiter:1522597807352057928> {interaction.user.mention}", inline=False
+            name="Aussteller",
+            value=f"> <:mitarbeiter:1522597807352057928> {interaction.user.mention}",
+            inline=False,
         )
-        log_e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        log_e.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
         await send_to_log_channel(interaction.guild, log_e)
 
-        s = dvg_embed("Kundenakte erfolgreich angelegt!",
-                     description="Diese Kundenakte wurde soeben angelegt. Eine Übersicht der wichtigsten Informationen finden Sie nachfolgend aufgelistet.")
+        s = dvg_embed(
+            "Kundenakte erfolgreich angelegt!",
+            description="Diese Kundenakte wurde soeben angelegt. Eine Übersicht der wichtigsten Informationen finden Sie nachfolgend aufgelistet.",
+        )
         s.add_field(
             name="Informationen",
             value=f"> <:id:1522597735205830666> `{customer_id}`\n> <:8312activethreads:1522597862779785276> {thread.thread.mention}\n> <:6509addguild:1522597829917413396> `{total_price:,.2f}€`\n> <:4426news:1522597790897803374> DM gesendet!",
             inline=False,
         )
-        s.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        s.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-        await interaction.edit_original_response(embed=s, view=None)
+        await interaction.edit_original_response(**ev(s))
     except Exception as e:
         logger.error(f"Kundenakte Fehler: {e}", exc_info=True)
         await interaction.edit_original_response(
-            embed=discord.Embed(title="Fehler!", description=str(e), color=EMBED_COLOR),
-            view=None,
+            **ev(DEmbed(title="Fehler!", description=str(e), color=EMBED_COLOR))
         )
 
 
@@ -2557,18 +3223,22 @@ async def create_customer(
 async def add_insurance_to_customer(interaction: discord.Interaction, customer_id: str):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
+                )
+            ),
         )
         return
     if customer_id not in data["customers"]:
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
+                )
+            ),
         )
         return
     customer = data["customers"][customer_id]
@@ -2576,23 +3246,21 @@ async def add_insurance_to_customer(interaction: discord.Interaction, customer_i
     ins_types = get_insurance_types()
     if not [ins for ins in ins_types if ins not in existing]:
         await interaction.response.send_message(
-            embed=dvg_embed("Alle Versicherungen abgeschlossen!"), ephemeral=True
+            ephemeral=True, **ev(dvg_embed("Alle Versicherungen abgeschlossen!"))
         )
         return
     view = AddInsuranceView(existing)
-    e = discord.Embed(
+    e = DEmbed(
         title="Versicherung nachbuchen",
         description=f"Kunde: **{customer['rp_name']}** (`{customer_id}`)\n\nBitte wähle die hinzuzufügenden Versicherungen.",
         color=EMBED_COLOR,
     )
-    await interaction.response.send_message(embed=e, view=view, ephemeral=True)
+    await interaction.response.send_message(ephemeral=True, **ev(e, view=view))
     await view.wait()
     if not view.confirmed:
-        await interaction.edit_original_response(
-            embed=dvg_embed("Abgebrochen."), view=None
-        )
+        await interaction.edit_original_response(**ev(dvg_embed("Abgebrochen.")))
         return
-    new_insurances = view.children[0].values
+    new_insurances = view.controls[0].values
     if not new_insurances:
         return
     for ins in new_insurances:
@@ -2624,15 +3292,18 @@ async def add_insurance_to_customer(interaction: discord.Interaction, customer_i
         )
         dm.add_field(
             name="Neue Versicherungen",
-            value="\n".join(f"> <:6509addguild:1522597829917413396> {ins}" for ins in new_insurances),
+            value="\n".join(
+                f"> <:6509addguild:1522597829917413396> {ins}" for ins in new_insurances
+            ),
             inline=False,
         )
         dm.add_field(
-            name="Monatsbeitrag (aktualisiert)", value=f"> <:einzahlung:1522597871051079710> `{new_total:,.2f}€`", inline=False
+            name="Monatsbeitrag (aktualisiert)",
+            value=f"> <:einzahlung:1522597871051079710> `{new_total:,.2f}€`",
+            inline=False,
         )
-        dm.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
         try:
-            await member.send(embed=dm)
+            await member.send(**ev(dm))
         except discord.Forbidden:
             pass
     add_log_entry(
@@ -2644,14 +3315,17 @@ async def add_insurance_to_customer(interaction: discord.Interaction, customer_i
     s = dvg_embed("Versicherungen nachgebucht!")
     s.add_field(
         name="Neue Versicherungen",
-        value="\n".join(f"> <:6509addguild:1522597829917413396> {ins}" for ins in new_insurances),
+        value="\n".join(
+            f"> <:6509addguild:1522597829917413396> {ins}" for ins in new_insurances
+        ),
         inline=False,
     )
     s.add_field(
-        name="Monatsbeitrag (aktualisiert)", value=f"> <:einzahlung:1522597871051079710> `{new_total:,.2f}€`", inline=False
+        name="Monatsbeitrag (aktualisiert)",
+        value=f"> <:einzahlung:1522597871051079710> `{new_total:,.2f}€`",
+        inline=False,
     )
-    s.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.edit_original_response(embed=s, view=None)
+    await interaction.edit_original_response(**ev(s))
 
 
 # ═══════════════════════════════════════════════════════
@@ -2669,20 +3343,24 @@ async def create_invoice(
 ):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
+                )
+            ),
         )
         return
     await interaction.response.defer(ephemeral=True)
     try:
         if customer_id not in data["customers"]:
             await interaction.followup.send(
-                embed=build_error_embed(
-                    "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
+                    )
+                ),
             )
             return
         customer = data["customers"][customer_id]
@@ -2691,11 +3369,13 @@ async def create_invoice(
         existing_inv = customer_has_unpaid_invoice(customer_id)
         if existing_inv:
             await interaction.followup.send(
-                embed=build_error_embed(
-                    "Offene Rechnung vorhanden!",
-                    f"Für **{customer['rp_name']}** existiert bereits eine offene Rechnung (`{existing_inv}`).\nBitte archivieren Sie diese zuerst, bevor eine neue ausgestellt werden kann.",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Offene Rechnung vorhanden!",
+                        f"Für **{customer['rp_name']}** existiert bereits eine offene Rechnung (`{existing_inv}`).\nBitte archivieren Sie diese zuerst, bevor eine neue ausgestellt werden kann.",
+                    )
+                ),
             )
             return
 
@@ -2707,13 +3387,17 @@ async def create_invoice(
         due_date = get_now() + timedelta(days=3)
         ins_types = get_insurance_types()
 
-        embed = discord.Embed(
+        embed = DEmbed(
             title=f"Versicherungsrechnung - {get_now().strftime('%d.%m.%Y')}",
             description="Dies ist eine Zahlungsaufforderung für Ihre Versicherungsbeiträge!",
             color=EMBED_COLOR,
             timestamp=get_now(),
         )
-        embed.add_field(name="Rechnungsinformationen", value=f"> <:id:1522597735205830666> `{invoice_id}`")
+        embed.big = True
+        embed.add_field(
+            name="Rechnungsinformationen",
+            value=f"> <:id:1522597735205830666> `{invoice_id}`",
+        )
         embed.add_field(
             name="Versicherungsnehmer",
             value=f"> <:member:1522597880437932112> {customer['rp_name']}\n> <:id:1522597735205830666> `{customer_id}`",
@@ -2751,9 +3435,8 @@ async def create_invoice(
             value=f"> <:9708withoutavoice:1522597896086618292> **{due_date.strftime('%d.%m.%Y')}**",
             inline=False,
         )
-        embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
 
-        message = await channel.send(embed=embed)
+        message = await channel.send(**ev(embed))
         data["invoices"][invoice_id] = {
             "customer_id": customer_id,
             "betrag": betrag_brutto,
@@ -2795,12 +3478,11 @@ async def create_invoice(
         s.add_field(
             name="Fällig", value=f"> {due_date.strftime('%d.%m.%Y')}", inline=True
         )
-        s.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        await interaction.followup.send(embed=s, ephemeral=True)
+        await interaction.followup.send(ephemeral=True, **ev(s))
     except Exception as e:
         logger.error(f"Rechnung Fehler: {e}", exc_info=True)
         await interaction.followup.send(
-            embed=build_error_embed("Fehler!", str(e)), ephemeral=True
+            ephemeral=True, **ev(build_error_embed("Fehler!", str(e)))
         )
 
 
@@ -2816,36 +3498,42 @@ async def create_invoice(
 async def archive_invoice(interaction: discord.Interaction, invoice_id: str):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
+                )
+            ),
         )
         return
     await interaction.response.defer(ephemeral=True)
     try:
         if invoice_id not in data["invoices"]:
             await interaction.followup.send(
-                embed=build_error_embed(
-                    "Nicht gefunden!", f"Keine Rechnung `{invoice_id}`."
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Nicht gefunden!", f"Keine Rechnung `{invoice_id}`."
+                    )
+                ),
             )
             return
         invoice = data["invoices"][invoice_id]
         if invoice.get("paid", False):
             await interaction.followup.send(
-                embed=dvg_embed("Bereits archiviert!"), ephemeral=True
+                ephemeral=True, **ev(dvg_embed("Bereits archiviert!"))
             )
             return
         customer_id = invoice["customer_id"]
         customer = data["customers"].get(customer_id)
         if not customer:
             await interaction.followup.send(
-                embed=build_error_embed(
-                    "Nicht gefunden!", f"Kunde `{customer_id}` nicht gefunden."
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Nicht gefunden!", f"Kunde `{customer_id}` nicht gefunden."
+                    )
+                ),
             )
             return
 
@@ -2865,19 +3553,19 @@ async def archive_invoice(interaction: discord.Interaction, invoice_id: str):
             ch = interaction.guild.get_channel(invoice["channel_id"])
             if ch:
                 msg = await ch.fetch_message(invoice["message_id"])
-                if msg.embeds:
-                    upd = msg.embeds[0]
-                    upd.color = COLOR_SUCCESS
-                    for i, field in enumerate(upd.fields):
-                        if "Status" in field.name:
-                            upd.set_field_at(
-                                i,
-                                name="Status: Bezahlt!",
-                                value=f"> <:datetime:1522597873286512777> **{get_now().strftime('%d.%m.%Y, %H:%M Uhr')}**\n> <:5554authapppermission:1522597727341646024> {interaction.user.mention}",
-                                inline=False,
+                await msg.edit(
+                    **restyle(
+                        msg,
+                        fields=[
+                            (
+                                "Status",
+                                "Status: Bezahlt!",
+                                f"> <:datetime:1522597873286512777> **{get_now().strftime('%d.%m.%Y, %H:%M Uhr')}**\n> <:5554authapppermission:1522597727341646024> {interaction.user.mention}",
                             )
-                            break
-                    await msg.edit(embed=upd)
+                        ],
+                        color=COLOR_SUCCESS,
+                    )
+                )
         except Exception as ex:
             logger.error(f"Rechnung Update Fehler: {ex}")
 
@@ -2907,8 +3595,7 @@ async def archive_invoice(interaction: discord.Interaction, invoice_id: str):
                         value=f"> <:archiviert:1522597781557219448> {interaction.user.mention}",
                         inline=False,
                     )
-                    ae.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-                    await thread.send(embed=ae)
+                    await thread.send(**ev(ae))
             except Exception as ex:
                 logger.error(f"Thread Eintrag Fehler: {ex}")
 
@@ -2923,19 +3610,18 @@ async def archive_invoice(interaction: discord.Interaction, invoice_id: str):
         )
         await update_customer_thread_backup(interaction.guild, customer_id)
 
-        s = discord.Embed(
+        s = DEmbed(
             title="Rechnung archiviert!",
             description=f"`{invoice_id}` als bezahlt markiert.",
             color=EMBED_COLOR,
         )
         s.add_field(name="Kunde", value=f"> {customer['rp_name']}", inline=True)
         s.add_field(name="Betrag", value=f"> `{invoice['betrag']:,.2f}€`", inline=True)
-        s.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        await interaction.followup.send(embed=s, ephemeral=True)
+        await interaction.followup.send(ephemeral=True, **ev(s))
     except Exception as e:
         logger.error(f"Archivieren Fehler: {e}", exc_info=True)
         await interaction.followup.send(
-            embed=build_error_embed("Fehler!", str(e)), ephemeral=True
+            ephemeral=True, **ev(build_error_embed("Fehler!", str(e)))
         )
 
 
@@ -2951,33 +3637,37 @@ async def archive_invoice(interaction: discord.Interaction, invoice_id: str):
 async def issue_manual_reminder(interaction: discord.Interaction, invoice_id: str):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
+                )
+            ),
         )
         return
     await interaction.response.defer(ephemeral=True)
     try:
         if invoice_id not in data["invoices"]:
             await interaction.followup.send(
-                embed=build_error_embed(
-                    "Nicht gefunden!", f"Keine Rechnung `{invoice_id}`."
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Nicht gefunden!", f"Keine Rechnung `{invoice_id}`."
+                    )
+                ),
             )
             return
         invoice = data["invoices"][invoice_id]
         if invoice.get("paid", False):
             await interaction.followup.send(
-                embed=dvg_embed("Bereits bezahlt!"), ephemeral=True
+                ephemeral=True, **ev(dvg_embed("Bereits bezahlt!"))
             )
             return
         customer = data["customers"].get(invoice["customer_id"])
         if not customer:
             await interaction.followup.send(
-                embed=build_error_embed("Nicht gefunden!", "Kunde nicht gefunden."),
                 ephemeral=True,
+                **ev(build_error_embed("Nicht gefunden!", "Kunde nicht gefunden.")),
             )
             return
 
@@ -2996,7 +3686,7 @@ async def issue_manual_reminder(interaction: discord.Interaction, invoice_id: st
         )
         await update_customer_thread_backup(interaction.guild, invoice["customer_id"])
 
-        s = discord.Embed(
+        s = DEmbed(
             title=f"{reminder_count}. Mahnung ausgestellt!",
             description=f"Rechnung `{invoice_id}`",
             color=EMBED_COLOR,
@@ -3008,11 +3698,10 @@ async def issue_manual_reminder(interaction: discord.Interaction, invoice_id: st
         )
         if surcharge_pct > 0:
             s.add_field(name="Mahngebühr", value=f"> +{surcharge_pct}%", inline=True)
-        s.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        await interaction.followup.send(embed=s, ephemeral=True)
+        await interaction.followup.send(ephemeral=True, **ev(s))
     except Exception as e:
         await interaction.followup.send(
-            embed=build_error_embed("Fehler!", str(e)), ephemeral=True
+            ephemeral=True, **ev(build_error_embed("Fehler!", str(e)))
         )
 
 
@@ -3029,7 +3718,7 @@ async def send_reminder(
             surcharge_tx = (
                 f" (+{surcharge_percent}% Mahngebühr)" if surcharge_percent > 0 else ""
             )
-            embed = discord.Embed(
+            embed = DEmbed(
                 title=f"{reminder_number}. Mahnung",
                 description=f"Die Rechnung `{invoice_id}` ist überfällig!",
                 color=EMBED_COLOR if reminder_number < 3 else COLOR_ERROR,
@@ -3045,11 +3734,7 @@ async def send_reminder(
                 value=f"> Ursprünglich: `{invoice_data['original_betrag']:,.2f}€`\n> **Aktuell: `{invoice_data['betrag']:,.2f}€`**{surcharge_tx}",
                 inline=False,
             )
-            embed.set_footer(
-                text="Copyright © InsuranceGuard v4",
-                icon_url=FOOTER_ICON,
-            )
-            await channel.send(member.mention if member else "", embed=embed)
+            await channel.send(**ev(embed, ping=member.mention if member else ""))
             add_log_entry(
                 f"MAHNUNG_{reminder_number}",
                 0,
@@ -3074,26 +3759,30 @@ async def send_reminder(
 async def archive_customer(interaction: discord.Interaction, customer_id: str):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
+                )
+            ),
         )
         return
     await interaction.response.defer(ephemeral=True)
     try:
         if customer_id not in data["customers"]:
             await interaction.followup.send(
-                embed=build_error_embed(
-                    "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
+                    )
+                ),
             )
             return
         customer = data["customers"][customer_id]
         if customer.get("status") == "archiviert":
             await interaction.followup.send(
-                embed=dvg_embed("Bereits archiviert!"), ephemeral=True
+                ephemeral=True, **ev(dvg_embed("Bereits archiviert!"))
             )
             return
         data["customers"][customer_id].update(
@@ -3128,8 +3817,7 @@ async def archive_customer(interaction: discord.Interaction, customer_id: str):
                         value=f"> {get_now().strftime('%d.%m.%Y, %H:%M Uhr')}",
                         inline=True,
                     )
-                    ae.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-                    await thread.send(embed=ae)
+                    await thread.send(**ev(ae))
             except Exception as ex:
                 logger.error(f"Thread Update Fehler: {ex}")
 
@@ -3156,17 +3844,16 @@ async def archive_customer(interaction: discord.Interaction, customer_id: str):
         )
         await update_customer_thread_backup(interaction.guild, customer_id)
 
-        s = discord.Embed(
+        s = DEmbed(
             title="Akte archiviert!",
             description=f"Kundenakte `{customer_id}` archiviert und alle Rollen entfernt.",
             color=EMBED_COLOR,
         )
-        s.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        await interaction.followup.send(embed=s, ephemeral=True)
+        await interaction.followup.send(ephemeral=True, **ev(s))
     except Exception as e:
         logger.error(f"Archivieren Fehler: {e}", exc_info=True)
         await interaction.followup.send(
-            embed=build_error_embed("Fehler!", str(e)), ephemeral=True
+            ephemeral=True, **ev(build_error_embed("Fehler!", str(e)))
         )
 
 
@@ -3202,7 +3889,9 @@ class AuszahlungAntragsModal(discord.ui.Modal, title="Auszahlungsantrag"):
                     self.betrag.value.replace(",", ".").replace("€", "").strip()
                 )
             except ValueError:
-                await interaction.followup.send(" Ungültiger Betrag.", ephemeral=True)
+                await interaction.followup.send(
+                    ephemeral=True, **ev_text(" Ungültiger Betrag.")
+                )
                 return
 
             verfügbar = get_verfügbares_guthaben(self.customer_id, self.versicherung)
@@ -3211,26 +3900,28 @@ class AuszahlungAntragsModal(discord.ui.Modal, title="Auszahlungsantrag"):
 
             if betrag_float <= 0:
                 await interaction.followup.send(
-                    " Betrag muss > 0 sein.", ephemeral=True
+                    ephemeral=True, **ev_text(" Betrag muss > 0 sein.")
                 )
                 return
             if betrag_float > verfügbar:
                 await interaction.followup.send(
-                    f" Betrag überschreitet verfügbares Guthaben `{verfügbar:,.2f}€`.",
                     ephemeral=True,
+                    **ev_text(
+                        f" Betrag überschreitet verfügbares Guthaben `{verfügbar:,.2f}€`."
+                    ),
                 )
                 return
 
             az_channel_id = config.get("auszahlung_channel_id")
             if not az_channel_id:
                 await interaction.followup.send(
-                    " Auszahlungs-Kanal nicht konfiguriert.", ephemeral=True
+                    ephemeral=True, **ev_text(" Auszahlungs-Kanal nicht konfiguriert.")
                 )
                 return
             az_channel = interaction.guild.get_channel(az_channel_id)
             if not az_channel:
                 await interaction.followup.send(
-                    " Auszahlungs-Kanal nicht gefunden.", ephemeral=True
+                    ephemeral=True, **ev_text(" Auszahlungs-Kanal nicht gefunden.")
                 )
                 return
 
@@ -3265,18 +3956,21 @@ class AuszahlungAntragsModal(discord.ui.Modal, title="Auszahlungsantrag"):
                 name="Beschreibung", value=f"```{beschreibung_tx}```", inline=False
             )
             embed.add_field(
-                name="Eingereicht von", value=f" {interaction.user.mention}", inline=True
+                name="Eingereicht von",
+                value=f" {interaction.user.mention}",
+                inline=True,
             )
             embed.add_field(name="Status", value="Ausstehend!", inline=False)
-            embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
 
             action_view = AuszahlungActionView(
                 auszahlung_id, self.customer_id, betrag_float
             )
             msg = await az_channel.send(
-                content=f"{ping_text} — Neuer Auszahlungsantrag!",
-                embed=embed,
-                view=action_view,
+                **ev(
+                    embed,
+                    view=action_view,
+                    ping=f"{ping_text} — Neuer Auszahlungsantrag!",
+                )
             )
 
             data["pending_auszahlungen"][auszahlung_id] = {
@@ -3302,7 +3996,7 @@ class AuszahlungAntragsModal(discord.ui.Modal, title="Auszahlungsantrag"):
                 },
             )
 
-            s = discord.Embed(
+            s = DEmbed(
                 title="Auszahlungsantrag eingereicht!",
                 description=f"Antrag `{auszahlung_id}` wurde weitergeleitet.",
                 color=EMBED_COLOR,
@@ -3311,15 +4005,13 @@ class AuszahlungAntragsModal(discord.ui.Modal, title="Auszahlungsantrag"):
             s.add_field(
                 name="Versicherung", value=f"> `{self.versicherung}`", inline=True
             )
-            s.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-            s.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-            await interaction.followup.send(embed=s, ephemeral=True)
+            await interaction.followup.send(ephemeral=True, **ev(s))
         except Exception as e:
             logger.error(f"Auszahlung Einreichen Fehler: {e}", exc_info=True)
-            await interaction.followup.send(f" Fehler: {e}", ephemeral=True)
+            await interaction.followup.send(ephemeral=True, **ev_text(f" Fehler: {e}"))
 
 
-class AuszahlungSelectView(discord.ui.View):
+class AuszahlungSelectView(EView):
     def __init__(self, customer_id: str, customer: dict):
         super().__init__(timeout=300)
         self.customer_id = customer_id
@@ -3354,7 +4046,7 @@ class AuszahlungSelectView(discord.ui.View):
         verfügbar = get_verfügbares_guthaben(self.customer_id, selected)
         if verfügbar <= 0:
             await interaction.response.send_message(
-                f"Limit für `{selected}` ausgeschöpft.", ephemeral=True
+                ephemeral=True, **ev_text(f"Limit für `{selected}` ausgeschöpft.")
             )
             return
         await interaction.response.send_modal(
@@ -3385,20 +4077,26 @@ class AuszahlungBestätigenModal(
         try:
             pending = data.get("pending_auszahlungen", {}).get(self.auszahlung_id)
             if not pending or pending.get("status") != "ausstehend":
-                await interaction.followup.send("Bereits bearbeitet.", ephemeral=True)
+                await interaction.followup.send(
+                    ephemeral=True, **ev_text("Bereits bearbeitet.")
+                )
                 return
             customer_id = pending["customer_id"]
             versicherung = pending["versicherung"]
             betrag = pending["betrag"]
             customer = data["customers"].get(customer_id)
             if not customer:
-                await interaction.followup.send("Kunde nicht gefunden.", ephemeral=True)
+                await interaction.followup.send(
+                    ephemeral=True, **ev_text("Kunde nicht gefunden.")
+                )
                 return
             verfügbar = get_verfügbares_guthaben(customer_id, versicherung)
             if betrag > verfügbar:
                 await interaction.followup.send(
-                    f"Guthaben reicht nicht aus (`{verfügbar:,.2f}€` verfügbar).",
                     ephemeral=True,
+                    **ev_text(
+                        f"Guthaben reicht nicht aus (`{verfügbar:,.2f}€` verfügbar)."
+                    ),
                 )
                 return
 
@@ -3439,9 +4137,7 @@ class AuszahlungBestätigenModal(
                             value=f"> Verfügbar: `{verfügbar:,.2f}€`\n> Ausgezahlt: `-{betrag:,.2f}€`\n> **Restguthaben: `{neues_guthaben:,.2f}€`**",
                             inline=False,
                         )
-                        ve.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-                        ve.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-                        await thread.send(embed=ve)
+                        await thread.send(**ev(ve))
                 except Exception as ex:
                     logger.error(f"Vermerk Fehler: {ex}")
 
@@ -3449,21 +4145,20 @@ class AuszahlungBestätigenModal(
                 az_channel = self.guild.get_channel(pending["channel_id"])
                 if az_channel:
                     orig_msg = await az_channel.fetch_message(pending["message_id"])
-                    if orig_msg.embeds:
-                        upd = orig_msg.embeds[0]
-                        upd.color = COLOR_SUCCESS
-                        for i, field in enumerate(upd.fields):
-                            if field.name == "Status":
-                                upd.set_field_at(
-                                    i, name="Status", value="Genehmigt!", inline=True
-                                )
-                                break
-                        upd.add_field(
-                            name="Genehmigt von",
-                            value=f"{self.confirmer.mention}",
-                            inline=True,
+                    await orig_msg.edit(
+                        **restyle(
+                            orig_msg,
+                            fields=[
+                                ("Status", "Status", "Genehmigt!"),
+                                (
+                                    "Genehmigt von",
+                                    "Genehmigt von",
+                                    self.confirmer.mention,
+                                ),
+                            ],
+                            color=COLOR_SUCCESS,
                         )
-                        await orig_msg.edit(embed=upd, view=None)
+                    )
             except Exception as ex:
                 logger.error(f"Antrag Update Fehler: {ex}")
 
@@ -3479,20 +4174,19 @@ class AuszahlungBestätigenModal(
             )
             await update_customer_thread_backup(self.guild, customer_id)
 
-            s = discord.Embed(
+            s = DEmbed(
                 title="Auszahlung bestätigt!",
                 description=f"Auszahlung `{self.auszahlung_id}` genehmigt.",
                 color=EMBED_COLOR,
             )
             s.add_field(name="Betrag", value=f"> `{betrag:,.2f}€`", inline=True)
-            s.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-            await interaction.followup.send(embed=s, ephemeral=True)
+            await interaction.followup.send(ephemeral=True, **ev(s))
         except Exception as e:
             logger.error(f"Bestätigen Fehler: {e}", exc_info=True)
-            await interaction.followup.send(f" Fehler: {e}", ephemeral=True)
+            await interaction.followup.send(ephemeral=True, **ev_text(f" Fehler: {e}"))
 
 
-class AuszahlungActionView(discord.ui.View):
+class AuszahlungActionView(EView):
     def __init__(self, auszahlung_id: str, customer_id: str, betrag: float):
         super().__init__(timeout=None)
         self.auszahlung_id = auszahlung_id
@@ -3517,19 +4211,21 @@ class AuszahlungActionView(discord.ui.View):
     ):
         if not is_firmenkontorolle(interaction):
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Zugriff verweigert!",
-                    "Nur das Firmenkonto kann Auszahlungsanträge bearbeiten.",
-                    "Firmenkonto",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Zugriff verweigert!",
+                        "Nur das Firmenkonto kann Auszahlungsanträge bearbeiten.",
+                        "Firmenkonto",
+                    )
+                ),
             )
             return
         az_id = self._get_az_id(interaction.message)
         pending = data.get("pending_auszahlungen", {}).get(az_id)
         if not pending or pending.get("status") != "ausstehend":
             await interaction.response.send_message(
-                " Bereits bearbeitet oder nicht gefunden.", ephemeral=True
+                ephemeral=True, **ev_text(" Bereits bearbeitet oder nicht gefunden.")
             )
             return
         await interaction.response.send_modal(
@@ -3546,17 +4242,19 @@ class AuszahlungActionView(discord.ui.View):
     ):
         if not is_firmenkontorolle(interaction):
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Zugriff verweigert!", "Nur das Firmenkonto.", "Firmenkonto"
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Zugriff verweigert!", "Nur das Firmenkonto.", "Firmenkonto"
+                    )
+                ),
             )
             return
         az_id = self._get_az_id(interaction.message)
         pending = data.get("pending_auszahlungen", {}).get(az_id)
         if not pending or pending.get("status") != "ausstehend":
             await interaction.response.send_message(
-                " Bereits bearbeitet.", ephemeral=True
+                ephemeral=True, **ev_text(" Bereits bearbeitet.")
             )
             return
         data["pending_auszahlungen"][az_id].update(
@@ -3568,23 +4266,23 @@ class AuszahlungActionView(discord.ui.View):
         )
         save_data(data)
         try:
-            upd = interaction.message.embeds[0]
-            upd.color = COLOR_ERROR
-            for i, field in enumerate(upd.fields):
-                if field.name == "Status":
-                    upd.set_field_at(i, name="Status", value="Abgelehnt!", inline=True)
-                    break
-            upd.add_field(
-                name="Abgelehnt von", value=f"{interaction.user.mention}", inline=True
+            await interaction.message.edit(
+                **restyle(
+                    interaction.message,
+                    fields=[
+                        ("Status", "Status", "Abgelehnt!"),
+                        ("Abgelehnt von", "Abgelehnt von", interaction.user.mention),
+                    ],
+                    color=COLOR_ERROR,
+                )
             )
-            await interaction.message.edit(embed=upd, view=None)
         except Exception as ex:
             logger.error(f"Update Fehler: {ex}")
         add_log_entry(
             "AUSZAHLUNG_ABGELEHNT", interaction.user.id, {"auszahlung_id": az_id}
         )
         await interaction.response.send_message(
-            f"Antrag `{az_id}` wurde abgelehnt.", ephemeral=True
+            ephemeral=True, **ev_text(f"Antrag `{az_id}` wurde abgelehnt.")
         )
 
 
@@ -3597,24 +4295,28 @@ class AuszahlungActionView(discord.ui.View):
 async def auszahlung_einreichen(interaction: discord.Interaction, customer_id: str):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
+                )
+            ),
         )
         return
     if customer_id not in data["customers"]:
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
+                )
+            ),
         )
         return
     customer = data["customers"][customer_id]
     if not customer.get("versicherungen"):
         await interaction.response.send_message(
-            " Keine Versicherungen vorhanden.", ephemeral=True
+            ephemeral=True, **ev_text(" Keine Versicherungen vorhanden.")
         )
         return
     ins_types = get_insurance_types()
@@ -3631,14 +4333,14 @@ async def auszahlung_einreichen(interaction: discord.Interaction, customer_id: s
         name="Auszahlungsguthaben", value=limits_text or "> Keine Daten", inline=False
     )
     await interaction.response.send_message(
-        embed=e, view=AuszahlungSelectView(customer_id, customer), ephemeral=True
+        ephemeral=True, **ev(e, view=AuszahlungSelectView(customer_id, customer))
     )
 
 
 # ═══════════════════════════════════════════════════════
 #   TICKET SYSTEM — PANELS
 # ═══════════════════════════════════════════════════════
-class KundenkontaktView(discord.ui.View):
+class KundenkontaktView(EView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -3653,7 +4355,7 @@ class KundenkontaktView(discord.ui.View):
         await interaction.response.send_modal(TicketModal())
 
 
-class SchadensmeldungView(discord.ui.View):
+class SchadensmeldungView(EView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -3671,7 +4373,7 @@ class SchadensmeldungView(discord.ui.View):
 # ═══════════════════════════════════════════════════════
 #   INAKTIVITÄTS-WARNUNG VIEW
 # ═══════════════════════════════════════════════════════
-class InaktivitätsWarnView(discord.ui.View):
+class InaktivitätsWarnView(EView):
     """Persistent View für die 16h-Inaktivitätswarnung."""
 
     def __init__(self):
@@ -3690,7 +4392,7 @@ class InaktivitätsWarnView(discord.ui.View):
 
         if not ticket_info:
             await interaction.response.send_message(
-                "Ticket-Daten nicht gefunden.", ephemeral=True
+                ephemeral=True, **ev_text("Ticket-Daten nicht gefunden.")
             )
             return
 
@@ -3699,11 +4401,13 @@ class InaktivitätsWarnView(discord.ui.View):
         cust_discord_id = customer.get("discord_user_id")
         if not is_mitarbeiter(interaction) and interaction.user.id != cust_discord_id:
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Zugriff verweigert!",
-                    "Nur Mitarbeiter oder der Versicherungsnehmer können das abbrechen.",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Zugriff verweigert!",
+                        "Nur Mitarbeiter oder der Versicherungsnehmer können das abbrechen.",
+                    )
+                ),
             )
             return
 
@@ -3714,16 +4418,15 @@ class InaktivitätsWarnView(discord.ui.View):
 
         button.disabled = True
         button.label = "Schließen abgebrochen"
-        await interaction.response.edit_message(view=self)
+        await interaction.response.edit_message(**ev_msg(interaction.message, self))
 
-        confirm = discord.Embed(
+        confirm = DEmbed(
             title="Automatisches Schließen abgebrochen",
             description=f"> {interaction.user.mention} hat das automatische Schließen abgebrochen.\n> Das Ticket bleibt geöffnet.",
             color=EMBED_COLOR,
             timestamp=get_now(),
         )
-        confirm.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        await interaction.channel.send(embed=confirm)
+        await interaction.channel.send(**ev(confirm))
 
 
 # ═══════════════════════════════════════════════════════
@@ -3754,7 +4457,7 @@ def get_ticket_customer_member(
     return guild.get_member(uid) if uid else None
 
 
-class CloseRequestView(discord.ui.View):
+class CloseRequestView(EView):
     """View für die Schließanfrage: Annehmen/Ablehnen — ausschließlich für den Kunden."""
 
     def __init__(self):
@@ -3770,29 +4473,33 @@ class CloseRequestView(discord.ui.View):
         ticket_info = data.get("ticket_channels", {}).get(ch_key)
         if not ticket_info:
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Fehler!",
-                    "Ticket-Daten nicht gefunden. Bitte wende dich an einen Administrator.",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Fehler!",
+                        "Ticket-Daten nicht gefunden. Bitte wende dich an einen Administrator.",
+                    )
+                ),
             )
             return
 
         customer_member = get_ticket_customer_member(interaction.guild, ticket_info)
         if not customer_member or interaction.user.id != customer_member.id:
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Zugriff verweigert!",
-                    "Nur der Kunde kann diese Schließanfrage beantworten.",
-                    "Kunde",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Zugriff verweigert!",
+                        "Nur der Kunde kann diese Schließanfrage beantworten.",
+                        "Kunde",
+                    )
+                ),
             )
             return
 
-        for child in self.children:
+        for child in self.controls:
             child.disabled = True
-        await interaction.response.edit_message(view=self)
+        await interaction.response.edit_message(**ev_msg(interaction.message, self))
 
         add_log_entry(
             "SCHLIESSANFRAGE_ANGENOMMEN",
@@ -3811,36 +4518,39 @@ class CloseRequestView(discord.ui.View):
         ticket_info = data.get("ticket_channels", {}).get(ch_key)
         if not ticket_info:
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Fehler!",
-                    "Ticket-Daten nicht gefunden. Bitte wende dich an einen Administrator.",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Fehler!",
+                        "Ticket-Daten nicht gefunden. Bitte wende dich an einen Administrator.",
+                    )
+                ),
             )
             return
 
         customer_member = get_ticket_customer_member(interaction.guild, ticket_info)
         if not customer_member or interaction.user.id != customer_member.id:
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Zugriff verweigert!",
-                    "Nur der Kunde kann diese Schließanfrage beantworten.",
-                    "Kunde",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Zugriff verweigert!",
+                        "Nur der Kunde kann diese Schließanfrage beantworten.",
+                        "Kunde",
+                    )
+                ),
             )
             return
 
-        for child in self.children:
+        for child in self.controls:
             child.disabled = True
-        await interaction.response.edit_message(view=self)
+        await interaction.response.edit_message(**ev_msg(interaction.message, self))
 
         deny_embed = dvg_embed(
             "Schließanfrage abgelehnt!",
-            f"> {interaction.user.mention} hat die Schließanfrage abgelehnt."
+            f"> {interaction.user.mention} hat die Schließanfrage abgelehnt.",
         )
-        deny_embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-        await interaction.channel.send(embed=deny_embed)
+        await interaction.channel.send(**ev(deny_embed))
         await reenable_close_request_button(interaction.channel, ticket_info)
         add_log_entry(
             "SCHLIESSANFRAGE_ABGELEHNT",
@@ -3858,14 +4568,13 @@ async def send_close_request(
         f"> {interaction.user.mention} hat darum gebeten, dieses Ticket zu schließen.\n"
         f"> Bitte nehmen Sie die Auswahl mithilfe der untenstehenden Schaltflächen vor.",
     )
-    request_embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-    await interaction.followup.send(embed=request_embed, view=CloseRequestView())
+    await interaction.followup.send(**ev(request_embed, view=CloseRequestView()))
 
     ch_key = str(interaction.channel.id)
     if ch_key in data.get("ticket_channels", {}):
-        data["ticket_channels"][ch_key]["close_request_panel_message_id"] = (
-            interaction.message.id
-        )
+        data["ticket_channels"][ch_key][
+            "close_request_panel_message_id"
+        ] = interaction.message.id
         save_data(data)
 
     add_log_entry(
@@ -3894,18 +4603,18 @@ async def reenable_close_request_button(
             new_view = SchadensmeldungTicketView()
             claimed_by = ticket_info.get("claimed_by")
             if claimed_by:
-                for child in new_view.children:
+                for child in new_view.controls:
                     if getattr(child, "custom_id", "") == "sd_claim_release":
                         child.label = "Freigeben"
                         child.style = discord.ButtonStyle.secondary
-        for child in new_view.children:
+        for child in new_view.controls:
             if getattr(child, "custom_id", "") in (
                 "sd_close_ticket",
                 "kk_close_ticket",
             ):
                 child.disabled = False
         try:
-            await panel_msg.edit(view=new_view)
+            await panel_msg.edit(**ev_msg(panel_msg, new_view))
         except discord.NotFound:
             pass
 
@@ -3915,7 +4624,7 @@ async def reenable_close_request_button(
         save_data(data)
 
 
-class SchadensmeldungTicketView(discord.ui.View):
+class SchadensmeldungTicketView(EView):
     """View für Schadensmeldungs-Tickets: Beanspruchen/Freigeben + Schließanfrage."""
 
     def __init__(self):
@@ -3934,11 +4643,13 @@ class SchadensmeldungTicketView(discord.ui.View):
 
         if not ticket_info:
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Fehler!",
-                    "Ticket-Daten nicht gefunden. Bitte wende dich an einen Administrator.",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Fehler!",
+                        "Ticket-Daten nicht gefunden. Bitte wende dich an einen Administrator.",
+                    )
+                ),
             )
             return
 
@@ -3948,12 +4659,14 @@ class SchadensmeldungTicketView(discord.ui.View):
             # ── BEANSPRUCHEN ──
             if not is_mitarbeiter(interaction):
                 await interaction.response.send_message(
-                    embed=build_error_embed(
-                        "Zugriff verweigert!",
-                        "Nur Mitarbeiter können Tickets beanspruchen.",
-                        "Mitarbeiter",
-                    ),
                     ephemeral=True,
+                    **ev(
+                        build_error_embed(
+                            "Zugriff verweigert!",
+                            "Nur Mitarbeiter können Tickets beanspruchen.",
+                            "Mitarbeiter",
+                        )
+                    ),
                 )
                 return
 
@@ -3964,7 +4677,7 @@ class SchadensmeldungTicketView(discord.ui.View):
             # Sofort Buttons aktualisieren — bevor langsame API-Calls kommen
             button.label = "Freigeben"
             button.style = discord.ButtonStyle.secondary
-            await interaction.response.edit_message(view=self)
+            await interaction.response.edit_message(**ev_msg(interaction.message, self))
 
             # Kanalberechtigungen anpassen
             for role in _get_roles(interaction.guild, MITARBEITER_ROLE_ID):
@@ -3980,10 +4693,9 @@ class SchadensmeldungTicketView(discord.ui.View):
 
             claim_embed = dvg_embed(
                 "Ticket beansprucht!",
-                f"{interaction.user.mention} hat dieses Ticket übernommen."
+                f"{interaction.user.mention} hat dieses Ticket übernommen.",
             )
-            claim_embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-            await interaction.channel.send(embed=claim_embed)
+            await interaction.channel.send(**ev(claim_embed))
             add_log_entry(
                 "TICKET_BEANSPRUCHT",
                 interaction.user.id,
@@ -3996,11 +4708,13 @@ class SchadensmeldungTicketView(discord.ui.View):
                 claimer = interaction.guild.get_member(claimed_by)
                 claimer_name = claimer.mention if claimer else f"`{claimed_by}`"
                 await interaction.response.send_message(
-                    embed=build_error_embed(
-                        "Zugriff verweigert!",
-                        f"Nur der Beansprucher ({claimer_name}) und die Leitungsebene können das Ticket freigeben.",
-                    ),
                     ephemeral=True,
+                    **ev(
+                        build_error_embed(
+                            "Zugriff verweigert!",
+                            f"Nur der Beansprucher ({claimer_name}) und die Leitungsebene können das Ticket freigeben.",
+                        )
+                    ),
                 )
                 return
 
@@ -4011,7 +4725,7 @@ class SchadensmeldungTicketView(discord.ui.View):
             # Sofort Buttons aktualisieren
             button.label = "Beanspruchen"
             button.style = discord.ButtonStyle.primary
-            await interaction.response.edit_message(view=self)
+            await interaction.response.edit_message(**ev_msg(interaction.message, self))
 
             # Kanalberechtigungen wiederherstellen
             for role in _get_roles(interaction.guild, MITARBEITER_ROLE_ID):
@@ -4023,10 +4737,9 @@ class SchadensmeldungTicketView(discord.ui.View):
 
             release_embed = dvg_embed(
                 "Ticket freigegeben!",
-                f"{interaction.user.mention} hat das Ticket freigegeben."
+                f"{interaction.user.mention} hat das Ticket freigegeben.",
             )
-            release_embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-            await interaction.channel.send(embed=release_embed)
+            await interaction.channel.send(**ev(release_embed))
             add_log_entry(
                 "TICKET_FREIGEGEBEN",
                 interaction.user.id,
@@ -4049,30 +4762,34 @@ class SchadensmeldungTicketView(discord.ui.View):
             or is_leitungsebene(interaction)
         ):
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Zugriff verweigert!",
-                    "Nur der Mitarbeiter, der dieses Ticket beansprucht hat, oder die Leitungsebene können eine Schließanfrage stellen.",
-                    "Beanspruchender Mitarbeiter / Leitungsebene",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Zugriff verweigert!",
+                        "Nur der Mitarbeiter, der dieses Ticket beansprucht hat, oder die Leitungsebene können eine Schließanfrage stellen.",
+                        "Beanspruchender Mitarbeiter / Leitungsebene",
+                    )
+                ),
             )
             return
         if ticket_info.get("close_request_panel_message_id"):
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Anfrage bereits gestellt!",
-                    "Es liegt bereits eine offene Schließanfrage für dieses Ticket vor.",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Anfrage bereits gestellt!",
+                        "Es liegt bereits eine offene Schließanfrage für dieses Ticket vor.",
+                    )
+                ),
             )
             return
 
         button.disabled = True
-        await interaction.response.edit_message(view=self)
+        await interaction.response.edit_message(**ev_msg(interaction.message, self))
         await send_close_request(interaction, ticket_info)
 
 
-class KundenkontaktTicketView(discord.ui.View):
+class KundenkontaktTicketView(EView):
     """View für Kundenkontakt-Tickets: Nur Schließanfrage-Button."""
 
     def __init__(self):
@@ -4094,31 +4811,35 @@ class KundenkontaktTicketView(discord.ui.View):
             or is_leitungsebene(interaction)
         ):
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Zugriff verweigert!",
-                    "Nur der Mitarbeiter, der dieses Ticket eröffnet hat, oder die Leitungsebene können eine Schließanfrage stellen.",
-                    "Zuständiger Mitarbeiter / Leitungsebene",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Zugriff verweigert!",
+                        "Nur der Mitarbeiter, der dieses Ticket eröffnet hat, oder die Leitungsebene können eine Schließanfrage stellen.",
+                        "Zuständiger Mitarbeiter / Leitungsebene",
+                    )
+                ),
             )
             return
         if ticket_info.get("close_request_panel_message_id"):
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Anfrage bereits gestellt!",
-                    "Es liegt bereits eine offene Schließanfrage für dieses Ticket vor.",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Anfrage bereits gestellt!",
+                        "Es liegt bereits eine offene Schließanfrage für dieses Ticket vor.",
+                    )
+                ),
             )
             return
 
         button.disabled = True
-        await interaction.response.edit_message(view=self)
+        await interaction.response.edit_message(**ev_msg(interaction.message, self))
         await send_close_request(interaction, ticket_info)
 
 
 # Legacy View — bleibt für vor dem Update erstellte Tickets
-class TicketCloseView(discord.ui.View):
+class TicketCloseView(EView):
     def __init__(self, channel_id: int, customer_id: str):
         super().__init__(timeout=None)
         self.channel_id = channel_id
@@ -4134,10 +4855,12 @@ class TicketCloseView(discord.ui.View):
     ):
         if not is_mitarbeiter(interaction):
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
+                    )
+                ),
             )
             return
         ch_key = str(interaction.channel.id)
@@ -4171,10 +4894,12 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
             customer_id = self.customer_id_input.value.strip()
             if customer_id not in data["customers"]:
                 await interaction.followup.send(
-                    embed=build_error_embed(
-                        "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
-                    ),
                     ephemeral=True,
+                    **ev(
+                        build_error_embed(
+                            "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
+                        )
+                    ),
                 )
                 return
             customer = data["customers"][customer_id]
@@ -4183,11 +4908,13 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
             existing_ma = get_active_ticket(interaction.user.id, "kundenkontakt")
             if existing_ma:
                 await interaction.followup.send(
-                    embed=build_error_embed(
-                        "Aktives Ticket vorhanden!",
-                        f"Du hast bereits ein offenes Kundenkontakt-Ticket (<#{existing_ma}>).\nBitte schließe dieses zuerst.",
-                    ),
                     ephemeral=True,
+                    **ev(
+                        build_error_embed(
+                            "Aktives Ticket vorhanden!",
+                            f"Du hast bereits ein offenes Kundenkontakt-Ticket (<#{existing_ma}>).\nBitte schließe dieses zuerst.",
+                        )
+                    ),
                 )
                 return
 
@@ -4195,11 +4922,13 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
             existing_cust = customer_has_active_ticket(customer_id, "kundenkontakt")
             if existing_cust:
                 await interaction.followup.send(
-                    embed=build_error_embed(
-                        "Ticket für diesen Kunden vorhanden!",
-                        f"Für **{customer['rp_name']}** existiert bereits ein Kundenkontakt-Ticket (<#{existing_cust}>).",
-                    ),
                     ephemeral=True,
+                    **ev(
+                        build_error_embed(
+                            "Ticket für diesen Kunden vorhanden!",
+                            f"Für **{customer['rp_name']}** existiert bereits ein Kundenkontakt-Ticket (<#{existing_cust}>).",
+                        )
+                    ),
                 )
                 return
 
@@ -4211,11 +4940,13 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
             )
             if not category:
                 await interaction.followup.send(
-                    embed=build_error_embed(
-                        "Nicht konfiguriert!",
-                        "Kundenkontakt-Kategorie nicht eingerichtet.",
-                    ),
                     ephemeral=True,
+                    **ev(
+                        build_error_embed(
+                            "Nicht konfiguriert!",
+                            "Kundenkontakt-Kategorie nicht eingerichtet.",
+                        )
+                    ),
                 )
                 return
 
@@ -4258,7 +4989,7 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
             )
 
             ins_types = get_insurance_types()
-            embed = discord.Embed(
+            embed = DEmbed(
                 title="Kundenkontakt", color=EMBED_COLOR, timestamp=get_now()
             )
             embed.add_field(
@@ -4275,20 +5006,21 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
                 value=f"```{self.reason.value[:500]}```",
                 inline=False,
             )
-            ins_info = "\n".join(f"> <:1821serversfolder:1522597744030777405> {ins}" for ins in customer["versicherungen"])
+            ins_info = "\n".join(
+                f"> <:1821serversfolder:1522597744030777405> {ins}"
+                for ins in customer["versicherungen"]
+            )
             embed.add_field(
                 name="Versicherungsübersicht",
                 value=f"{ins_info}\n> <:8558viewasrolearrow:1522597865350889472>  `{customer['total_monthly_price']:,.2f}€/Monat`",
                 inline=False,
             )
-            embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-            embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
 
             mentions = [interaction.user.mention] + (
                 [customer_user.mention] if customer_user else []
             )
             await ticket_channel.send(
-                " ".join(mentions), embed=embed, view=KundenkontaktTicketView()
+                **ev(embed, view=KundenkontaktTicketView(), ping=" ".join(mentions))
             )
 
             # ticket_channels registrieren
@@ -4322,15 +5054,15 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
                 anliegen=f"Kundenkontakt — {self.reason.value[:200]}",
             )
 
-            s = discord.Embed(
+            s = DEmbed(
                 title="Ticket erstellt!",
                 description=f"<:5975popout:1522597818127220816> {ticket_channel.mention}",
                 color=EMBED_COLOR,
             )
-            await interaction.followup.send(embed=s, ephemeral=True)
+            await interaction.followup.send(ephemeral=True, **ev(s))
         except Exception as e:
             logger.error(f"Ticket Fehler: {e}", exc_info=True)
-            await interaction.followup.send(f"Fehler: {e}", ephemeral=True)
+            await interaction.followup.send(ephemeral=True, **ev_text(f"Fehler: {e}"))
 
 
 # ═══════════════════════════════════════════════════════
@@ -4372,10 +5104,12 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
             customer_id = self.customer_id_input.value.strip()
             if customer_id not in data["customers"]:
                 await interaction.followup.send(
-                    embed=build_error_embed(
-                        "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
-                    ),
                     ephemeral=True,
+                    **ev(
+                        build_error_embed(
+                            "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
+                        )
+                    ),
                 )
                 return
             customer = data["customers"][customer_id]
@@ -4395,7 +5129,7 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
                     name="Kunden-ID", value=f"> `{customer_id}`", inline=True
                 )
                 bl_e.add_field(name="Gesperrt seit", value=f"> `{added}`", inline=True)
-                await interaction.followup.send(embed=bl_e, ephemeral=True)
+                await interaction.followup.send(ephemeral=True, **ev(bl_e))
                 add_log_entry(
                     "BLACKLIST_BLOCK",
                     interaction.user.id,
@@ -4407,11 +5141,13 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
             existing = customer_has_active_ticket(customer_id, "schadensmeldung")
             if existing:
                 await interaction.followup.send(
-                    embed=build_error_embed(
-                        "Aktive Schadensmeldung vorhanden!",
-                        f"Für **{customer['rp_name']}** existiert bereits eine offene Schadensmeldung (<#{existing}>).\nBitte warte, bis diese bearbeitet wurde.",
-                    ),
                     ephemeral=True,
+                    **ev(
+                        build_error_embed(
+                            "Aktive Schadensmeldung vorhanden!",
+                            f"Für **{customer['rp_name']}** existiert bereits eine offene Schadensmeldung (<#{existing}>).\nBitte warte, bis diese bearbeitet wurde.",
+                        )
+                    ),
                 )
                 return
 
@@ -4442,7 +5178,7 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
                 fraud_e.add_field(
                     name="Kunden-ID (original)", value=f"> `{dup_cid}`", inline=True
                 )
-                await interaction.followup.send(embed=fraud_e, ephemeral=True)
+                await interaction.followup.send(ephemeral=True, **ev(fraud_e))
                 add_log_entry(
                     "BETRUGSVERSUCH_ERKANNT",
                     interaction.user.id,
@@ -4462,11 +5198,13 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
             )
             if not category:
                 await interaction.followup.send(
-                    embed=build_error_embed(
-                        "Nicht konfiguriert!",
-                        "Schadensmeldungs-Kategorie nicht eingerichtet.",
-                    ),
                     ephemeral=True,
+                    **ev(
+                        build_error_embed(
+                            "Nicht konfiguriert!",
+                            "Schadensmeldungs-Kategorie nicht eingerichtet.",
+                        )
+                    ),
                 )
                 return
 
@@ -4517,15 +5255,18 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
                 inline=False,
             )
             embed.add_field(
-                name="Nachweis (Rechnung)", value=f"> <:7896pinned:1522597854223274065> `{nachweis_val}`", inline=False
+                name="Nachweis (Rechnung)",
+                value=f"> <:7896pinned:1522597854223274065> `{nachweis_val}`",
+                inline=False,
             )
-            embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
 
             ma_ping = " ".join(r.mention for r in ma_roles) if ma_roles else ""
             await ticket_channel.send(
-                f"{ma_ping} — Neue Schadensmeldung!",
-                embed=embed,
-                view=SchadensmeldungTicketView(),
+                **ev(
+                    embed,
+                    view=SchadensmeldungTicketView(),
+                    ping=f"{ma_ping} — Neue Schadensmeldung!",
+                )
             )
 
             jetzt = get_now().isoformat()
@@ -4577,14 +5318,13 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
             )
 
             s = dvg_embed(
-                "Schadensmeldung eingereicht!", f" <:5975popout:1522597818127220816> {ticket_channel.mention}"
+                "Schadensmeldung eingereicht!",
+                f" <:5975popout:1522597818127220816> {ticket_channel.mention}",
             )
-            s.set_author(name="", icon_url="")
-            s.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-            await interaction.followup.send(embed=s, ephemeral=True)
+            await interaction.followup.send(ephemeral=True, **ev(s))
         except Exception as e:
             logger.error(f"Schadensmeldung Fehler: {e}")
-            await interaction.followup.send(f"Fehler: {e}", ephemeral=True)
+            await interaction.followup.send(ephemeral=True, **ev_text(f"Fehler: {e}"))
 
 
 # ═══════════════════════════════════════════════════════
@@ -4595,10 +5335,12 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
 async def add_user_to_ticket(interaction: discord.Interaction, user: discord.Member):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
+                )
+            ),
         )
         return
     if not (
@@ -4606,19 +5348,18 @@ async def add_user_to_ticket(interaction: discord.Interaction, user: discord.Mem
         or interaction.channel.name.startswith("schaden-")
     ):
         await interaction.response.send_message(
-            " Nur in Ticket-Channels nutzbar.", ephemeral=True
+            ephemeral=True, **ev_text(" Nur in Ticket-Channels nutzbar.")
         )
         return
     await interaction.channel.set_permissions(
         user, read_messages=True, send_messages=True, read_message_history=True
     )
-    e = discord.Embed(
+    e = DEmbed(
         title="Person hinzugefügt!",
         description=f"{interaction.user.mention} hat {user.mention} zu Ticket hinzugefügt.",
         color=EMBED_COLOR,
     )
-    e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.response.send_message(embed=e)
+    await interaction.response.send_message(**ev(e))
 
 
 @bot.tree.command(
@@ -4630,10 +5371,12 @@ async def remove_user_from_ticket(
 ):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
+                )
+            ),
         )
         return
     if not (
@@ -4641,17 +5384,16 @@ async def remove_user_from_ticket(
         or interaction.channel.name.startswith("schaden-")
     ):
         await interaction.response.send_message(
-            " Nur in Ticket-Channels nutzbar.", ephemeral=True
+            ephemeral=True, **ev_text(" Nur in Ticket-Channels nutzbar.")
         )
         return
     await interaction.channel.set_permissions(user, overwrite=None)
-    e = discord.Embed(
+    e = DEmbed(
         title="Person entfernt!",
         description=f"{interaction.user.mention} hat {user.mention} vom Ticket entfernt.",
         color=EMBED_COLOR,
     )
-    e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.response.send_message(embed=e)
+    await interaction.response.send_message(**ev(e))
 
 
 # ═══════════════════════════════════════════════════════
@@ -4664,17 +5406,19 @@ async def remove_user_from_ticket(
 async def show_logs(interaction: discord.Interaction, anzahl: int = 10):
     if not is_leitungsebene(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur die Leitungsebene.", "Leitungsebene"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur die Leitungsebene.", "Leitungsebene"
+                )
+            ),
         )
         return
     await interaction.response.defer(ephemeral=True)
     try:
         if not data["logs"]:
             await interaction.followup.send(
-                embed=dvg_embed("Keine Logs vorhanden!"), ephemeral=True
+                ephemeral=True, **ev(dvg_embed("Keine Logs vorhanden!"))
             )
             return
         anzahl = max(1, min(anzahl, 25))
@@ -4697,7 +5441,7 @@ async def show_logs(interaction: discord.Interaction, anzahl: int = 10):
             "VERSICHERUNG_NACHGEBUCHT": ("", "Versicherung nachgebucht"),
             "VERSICHERUNG_GEKUENDIGT": ("", "Versicherung gekündigt"),
         }
-        embed = discord.Embed(
+        embed = DEmbed(
             title="Aktivitätsprotokoll",
             description=f"**Letzte {len(recent)} Aktivitäten**",
             color=EMBED_COLOR,
@@ -4726,12 +5470,11 @@ async def show_logs(interaction: discord.Interaction, anzahl: int = 10):
                 value=f"> **{ts}**\n> {user_name}\n{detail_str}",
                 inline=False,
             )
-        embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(ephemeral=True, **ev(embed))
     except Exception as e:
         logger.error(f"Logs Fehler: {e}", exc_info=True)
         await interaction.followup.send(
-            embed=build_error_embed("Fehler!", str(e)), ephemeral=True
+            ephemeral=True, **ev(build_error_embed("Fehler!", str(e)))
         )
 
 
@@ -4762,36 +5505,42 @@ async def show_customer(
         )
         if not found_id:
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Keine Akte gefunden!",
-                    "Für Ihren Account wurde keine aktive Versicherungsakte gefunden.\nBitte wenden Sie sich an einen Mitarbeiter.",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Keine Akte gefunden!",
+                        "Für Ihren Account wurde keine aktive Versicherungsakte gefunden.\nBitte wenden Sie sich an einen Mitarbeiter.",
+                    )
+                ),
             )
             return
         customer_id = found_id
     else:
         if not customer_id:
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Fehlende Angabe!",
-                    "Bitte geben Sie eine Versicherungsnehmer-ID an.",
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Fehlende Angabe!",
+                        "Bitte geben Sie eine Versicherungsnehmer-ID an.",
+                    )
+                ),
             )
             return
         if customer_id not in data["customers"]:
             await interaction.response.send_message(
-                embed=build_error_embed(
-                    "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
-                ),
                 ephemeral=True,
+                **ev(
+                    build_error_embed(
+                        "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
+                    )
+                ),
             )
             return
 
     customer = data["customers"][customer_id]
     ins_types = get_insurance_types()
-    embed = discord.Embed(
+    embed = DEmbed(
         title=f" Kundenakte — {customer['rp_name']}",
         color=EMBED_COLOR,
         timestamp=get_now(),
@@ -4837,16 +5586,19 @@ async def show_customer(
     )
     thread_id = customer.get("thread_id")
     if thread_id:
-        embed.add_field(name="Versicherungsakte", value=f"> <:8312activethreads:1522597862779785276> <#{thread_id}>", inline=False)
+        embed.add_field(
+            name="Versicherungsakte",
+            value=f"> <:8312activethreads:1522597862779785276> <#{thread_id}>",
+            inline=False,
+        )
 
     embed.add_field(
         name="Systemdaten (Erstellung)",
         value=f"> <:datetime:1522597873286512777> {make_aware(datetime.fromisoformat(customer['created_at'])).strftime('%d.%m.%Y, %H:%M Uhr')}\n> <:mitarbeiter:1522597807352057928> <@{customer['discord_user_id']}>",
         inline=False,
     )
-    embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
     await interaction.response.send_message(
-        content=f"<@{customer['discord_user_id']}>", embed=embed, ephemeral=True
+        ephemeral=True, **ev(embed, ping=f"<@{customer['discord_user_id']}>")
     )
 
 
@@ -4859,10 +5611,12 @@ async def show_customer(
 async def show_stats(interaction: discord.Interaction):
     if not is_leitungsebene(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur die Leitungsebene.", "Leitungsebene"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur die Leitungsebene.", "Leitungsebene"
+                )
+            ),
         )
         return
     customers = data.get("customers", {})
@@ -4933,9 +5687,7 @@ async def show_stats(interaction: discord.Interaction):
         ),
         inline=False,
     )
-    embed.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-    embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(ephemeral=True, **ev(embed))
 
 
 # ═══════════════════════════════════════════════════════
@@ -4950,18 +5702,22 @@ async def show_stats(interaction: discord.Interaction):
 async def cmd_schaden_historie(interaction: discord.Interaction, customer_id: str):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
+                )
+            ),
         )
         return
     if customer_id not in data["customers"]:
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
+                )
+            ),
         )
         return
 
@@ -5014,74 +5770,7 @@ async def cmd_schaden_historie(interaction: discord.Interaction, customer_id: st
             inline=False,
         )
 
-    await interaction.response.send_message(embed=e, ephemeral=True)
-
-
-# ═══════════════════════════════════════════════════════
-#   PORTAL-ZUGANG
-# ═══════════════════════════════════════════════════════
-@bot.tree.command(
-    name="portal-zugang",
-    description="Generiert einen Portal-Zugangslink für Mitarbeiter (keine DM an den Kunden)",
-)
-@app_commands.describe(customer_id="Versicherungsnehmer-ID")
-@app_commands.autocomplete(customer_id=customer_id_autocomplete)
-async def cmd_portal_zugang(interaction: discord.Interaction, customer_id: str):
-    if not is_mitarbeiter(interaction):
-        await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
-            ),
-            ephemeral=True,
-        )
-        return
-    if customer_id not in data["customers"]:
-        await interaction.response.send_message(
-            embed=build_error_embed(
-                "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
-            ),
-            ephemeral=True,
-        )
-        return
-
-    customer = data["customers"][customer_id]
-    if customer.get("status") == "archiviert":
-        await interaction.response.send_message(
-            embed=build_error_embed(
-                "Akte archiviert!",
-                "Für archivierte Kunden kann kein Portal-Zugang ausgestellt werden.",
-            ),
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    token = generate_portal_token(customer_id)
-    portal_url = f"{BOT_BASE_URL}/portal/{token}" if BOT_BASE_URL else None
-
-    result = dvg_embed(
-        "Portal-Zugang",
-        f"> Zugangslink für **{customer['rp_name']}** (`{customer_id}`).",
-    )
-    result.set_author(name=AUTHOR_NAME, icon_url=AUTHOR_ICON)
-    link_view = None
-    if portal_url:
-        link_view = discord.ui.View()
-        link_view.add_item(discord.ui.Button(label="Zum Kundenportal", url=portal_url))
-    else:
-        result.add_field(
-            name="Hinweis",
-            value="> `BOT_BASE_URL` nicht gesetzt — kein Link generierbar.\n"
-            "> Bitte Umgebungsvariable auf Render.com konfigurieren.",
-            inline=False,
-        )
-    add_log_entry(
-        "PORTAL_ZUGANG_AUSGESTELLT",
-        interaction.user.id,
-        {"customer_id": customer_id},
-    )
-    await interaction.followup.send(embed=result, view=link_view, ephemeral=True)
+    await interaction.response.send_message(ephemeral=True, **ev(e))
 
 
 # ═══════════════════════════════════════════════════════
@@ -5094,10 +5783,12 @@ async def cmd_portal_zugang(interaction: discord.Interaction, customer_id: str):
 async def cmd_panel_aktualisieren(interaction: discord.Interaction):
     if not is_admin(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
+                )
+            ),
         )
         return
     await interaction.response.defer(ephemeral=True)
@@ -5116,7 +5807,7 @@ async def cmd_panel_aktualisieren(interaction: discord.Interaction):
             "> `-` Die Bot-Nachricht wurde gelöscht oder ist nicht mehr auffindbar\n"
             "> `-` Bitte Panel neu posten mit `/einstellung-kanaele`",
         )
-    await interaction.followup.send(embed=e, ephemeral=True)
+    await interaction.followup.send(ephemeral=True, **ev(e))
 
 
 # ═══════════════════════════════════════════════════════
@@ -5134,27 +5825,33 @@ async def cmd_blacklist_add(
 ):
     if not is_leitungsebene(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur die Leitungsebene.", "Leitungsebene"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur die Leitungsebene.", "Leitungsebene"
+                )
+            ),
         )
         return
     if customer_id not in data["customers"]:
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Nicht gefunden!", f"Keine Akte mit ID `{customer_id}`."
+                )
+            ),
         )
         return
     if is_blacklisted(customer_id):
         await interaction.response.send_message(
-            embed=dvg_embed(
-                "Bereits gesperrt",
-                f"> Kunden-ID `{customer_id}` ist bereits auf der Blacklist.",
-            ),
             ephemeral=True,
+            **ev(
+                dvg_embed(
+                    "Bereits gesperrt",
+                    f"> Kunden-ID `{customer_id}` ist bereits auf der Blacklist.",
+                )
+            ),
         )
         return
 
@@ -5175,7 +5872,7 @@ async def cmd_blacklist_add(
     e.add_field(
         name="Datum", value=f"> `{get_now().strftime('%d.%m.%Y %H:%M')}`", inline=True
     )
-    await interaction.response.send_message(embed=e, ephemeral=True)
+    await interaction.response.send_message(ephemeral=True, **ev(e))
     await send_to_log_channel(interaction.guild, e)
     add_log_entry(
         "BLACKLIST_ADD",
@@ -5192,18 +5889,22 @@ async def cmd_blacklist_add(
 async def cmd_blacklist_remove(interaction: discord.Interaction, customer_id: str):
     if not is_leitungsebene(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur die Leitungsebene.", "Leitungsebene"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur die Leitungsebene.", "Leitungsebene"
+                )
+            ),
         )
         return
     if not is_blacklisted(customer_id):
         await interaction.response.send_message(
-            embed=dvg_embed(
-                "Nicht gesperrt", f"> `{customer_id}` ist nicht auf der Blacklist."
-            ),
             ephemeral=True,
+            **ev(
+                dvg_embed(
+                    "Nicht gesperrt", f"> `{customer_id}` ist nicht auf der Blacklist."
+                )
+            ),
         )
         return
 
@@ -5220,7 +5921,7 @@ async def cmd_blacklist_remove(interaction: discord.Interaction, customer_id: st
     e.add_field(
         name="Aufgehoben von", value=f"> {interaction.user.mention}", inline=True
     )
-    await interaction.response.send_message(embed=e, ephemeral=True)
+    await interaction.response.send_message(ephemeral=True, **ev(e))
     await send_to_log_channel(interaction.guild, e)
     add_log_entry("BLACKLIST_REMOVE", interaction.user.id, {"customer_id": customer_id})
 
@@ -5229,10 +5930,12 @@ async def cmd_blacklist_remove(interaction: discord.Interaction, customer_id: st
 async def cmd_blacklist_liste(interaction: discord.Interaction):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
-            embed=build_error_embed(
-                "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
-            ),
             ephemeral=True,
+            **ev(
+                build_error_embed(
+                    "Zugriff verweigert!", "Nur Mitarbeiter.", "Mitarbeiter"
+                )
+            ),
         )
         return
     bl = data.get("blacklist", {})
@@ -5258,7 +5961,7 @@ async def cmd_blacklist_liste(interaction: discord.Interaction):
                 ),
                 inline=False,
             )
-    await interaction.response.send_message(embed=e, ephemeral=True)
+    await interaction.response.send_message(ephemeral=True, **ev(e))
 
 
 # ═══════════════════════════════════════════════════════
@@ -5329,13 +6032,12 @@ async def auto_backup():
             value=f"> {get_now().strftime('%d.%m.%Y, %H:%M:%S Uhr')}",
             inline=False,
         )
-        e.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
         for guild in bot.guilds:
             ch = guild.get_channel(config["log_channel_id"])
             if ch:
                 buf = create_zip_buffer()
                 file = discord.File(buf, filename=f"auto_backup_{ts}.zip")
-                await ch.send(embed=e, file=file)
+                await ch.send(file=file, **ev(e, file=file.filename))
                 break
     except Exception as ex:
         logger.error(f"Auto-Backup Fehler: {ex}", exc_info=True)
@@ -5350,64 +6052,65 @@ async def refresh_schadensmeldung_panel():
     await _do_panel_refresh()
 
 
+def build_schadensmeldung_panel_embed() -> DEmbed:
+    """Panel-Inhalt für das Schadensmeldungs-Panel (inkl. aktueller Bearbeitungszeit)."""
+    embed_sm = dvg_embed(
+        "Schadensmeldung",
+        "Liebe Versicherungsnehmer:innen,\n> hier können sie Schadensmeldungen einreichen.",
+    )
+    embed_sm.add_field(
+        name="Wie funktioniert das System?",
+        value="> 1. Klicken Sie auf den Button unten!\n> 2. Geben Sie Ihre Kunden-ID ein!\n> 3. Füllen Sie das Formular aus!\n> 4. Ein Schadensfall-Ticket wird erstellt!",
+        inline=False,
+    )
+    embed_sm.add_field(
+        name="Welche Angaben sind erforderlich?",
+        value="> `-` **Kunden-ID**\n> `-` **Geschädigter** (RP-Name)\n> `-` **Täter** (RP-Name)\n> `-` **Vorfallbeschreibung**\n> `-` **Rechnung/Nachweis**",
+        inline=False,
+    )
+    # Voraussichtliche Bearbeitungszeit aus ticket_stats berechnen
+    sm_stats = [
+        s
+        for s in data.get("ticket_stats", [])
+        if s.get("type") == "schadensmeldung" and s.get("duration_minutes")
+    ]
+    if sm_stats:
+        avg_m = int(sum(s["duration_minutes"] for s in sm_stats) / len(sm_stats))
+        h, m = divmod(avg_m, 60)
+        avg_tx = f"`{h}h {m}min`" if h else f"`{m} Minuten`"
+        bearbzeit = f"> Voraussichtliche Bearbeitungszeit: {avg_tx}\n> Basierend auf {len(sm_stats)} abgeschlossenen Vorgängen."
+    else:
+        bearbzeit = "> Voraussichtliche Bearbeitungszeit: *N/A*"
+    embed_sm.add_field(name="Bearbeitungszeit", value=bearbzeit, inline=False)
+    embed_sm.big = True
+    return embed_sm
+
+
 async def _do_panel_refresh() -> bool:
     """
     Kernlogik für den Panel-Refresh — separat aufrufbar (Command + Task).
+    Baut das Schadensmeldungs-Panel mit aktueller Bearbeitungszeit neu auf.
     Gibt True zurück wenn das Panel erfolgreich aktualisiert wurde.
     """
     try:
         sm_ch_id = config.get("schadensmeldung_channel_id")
         if not sm_ch_id:
             return False
-
-        sm_stats = [
-            s
-            for s in data.get("ticket_stats", [])
-            if s.get("type") == "schadensmeldung" and s.get("duration_minutes")
-        ]
-
-        if sm_stats:
-            avg_m = int(sum(s["duration_minutes"] for s in sm_stats) / len(sm_stats))
-            h, m = divmod(avg_m, 60)
-            avg_tx = f"`{h}h {m}min`" if h else f"`{m} Minuten`"
-            bearbzeit = (
-                f"> Voraussichtliche Bearbeitungszeit: {avg_tx}\n"
-                f"> Basierend auf {len(sm_stats)} abgeschlossenen Vorgängen."
-            )
-        else:
-            bearbzeit = "> Voraussichtliche Bearbeitungszeit: *N/A*"
-
         for guild in bot.guilds:
             ch = guild.get_channel(sm_ch_id)
             if not ch:
                 continue
             async for msg in ch.history(limit=30):
-                if msg.author.id != bot.user.id or not msg.embeds:
+                if msg.author.id != bot.user.id:
                     continue
-                emb = msg.embeds[0]
-
-                # Prüfen ob das Feld bereits existiert
-                feld_existiert = any(f.name == "Bearbeitungszeit" for f in emb.fields)
-
-                new_fields = []
-                for field in emb.fields:
-                    if field.name == "Bearbeitungszeit":
-                        new_fields.append(("Bearbeitungszeit", bearbzeit, False))
-                    else:
-                        new_fields.append((field.name, field.value, field.inline))
-
-                # Feld nicht vorhanden → ans Ende anhängen
-                if not feld_existiert:
-                    new_fields.append(("Bearbeitungszeit", bearbzeit, False))
-
-                emb.clear_fields()
-                for name, value, inline in new_fields:
-                    emb.add_field(name=name, value=value, inline=inline)
-
-                await msg.edit(embed=emb)
-                logger.info(
-                    f"Panel aktualisiert — {len(sm_stats)} Vorgänge, Ø {bearbzeit[:60]}"
+                if "open_schadensmeldung" not in message_custom_ids(msg):
+                    continue
+                await msg.edit(
+                    **v2_edit(
+                        msg, build_schadensmeldung_panel_embed(), SchadensmeldungView()
+                    )
                 )
+                logger.info("Schadensmeldungs-Panel aktualisiert")
                 return True
             break
     except Exception as ex:
@@ -5427,9 +6130,9 @@ async def on_message(message: discord.Message):
     ch_key = str(message.channel.id)
     if ch_key in data.get("ticket_channels", {}):
         data["ticket_channels"][ch_key]["last_human_message"] = get_now().isoformat()
-        data["ticket_channels"][ch_key]["inactivity_warned_at"] = (
-            None  # Timer zurücksetzen
-        )
+        data["ticket_channels"][ch_key][
+            "inactivity_warned_at"
+        ] = None  # Timer zurücksetzen
         save_data(data)
     await bot.process_commands(message)
 
@@ -5485,936 +6188,32 @@ async def _before_inactivity():
 
 
 # ═══════════════════════════════════════════════════════
-#   KEEP-ALIVE (Render.com)
+#   HEALTH-CHECK (Render.com) — kein Dashboard, keine Webseite
 # ═══════════════════════════════════════════════════════
-from flask import Flask, request, redirect
-from threading import Thread
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"InsuranceGuard v4 laeuft!"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-app_flask = Flask("")
-
-
-@app_flask.route("/")
-def home():
-    return "InsuranceGuard v4 läuft!"
-
-
-@app_flask.route("/health")
-def health():
-    return {
-        "status": "healthy",
-        "bot": bot.user.name if bot.user else "starting",
-        "version": "InsuranceGuard v4",
-        "latency_ms": round(bot.latency * 1000) if bot.latency else None,
-        "customers": len(data.get("customers", {})),
-        "open_tickets": len(data.get("ticket_channels", {})),
-        "timestamp": get_now().isoformat(),
-    }
-
-
-@app_flask.route("/transcript/<transcript_id>")
-def serve_transcript(transcript_id: str):
-    """Liefert das gespeicherte HTML-Transcript (Discord-Style Dashboard)."""
-    # Nur alphanumerische Zeichen + Bindestriche erlaubt (UUID-Format)
-    safe_id = "".join(c for c in transcript_id if c.isalnum() or c == "-")
-    path = f"transcripts/{safe_id}.html"
-    if not os.path.exists(path):
-        return "<h1>Transcript nicht gefunden oder abgelaufen.</h1>", 404
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read(), 200, {"Content-Type": "text/html; charset=utf-8"}
-
-
-# ═══════════════════════════════════════════════════════
-#   KUNDEN-PORTAL — Helfer & Token-System
-# ═══════════════════════════════════════════════════════
-def generate_portal_token(customer_id: str) -> str:
-    """Gibt vorhandenen Token zurück oder erstellt einen neuen."""
-    if customer_id not in data["customers"]:
-        return ""
-    if not data["customers"][customer_id].get("portal_token"):
-        data["customers"][customer_id]["portal_token"] = uuid.uuid4().hex
-        save_data(data)
-    return data["customers"][customer_id]["portal_token"]
-
-
-def get_customer_by_token(token: str):
-    """Sucht Kunden anhand des Portal-Tokens. Gibt (customer_id, customer) zurück."""
-    clean = token.strip().lower()
-    for cid, c in data["customers"].items():
-        if c.get("portal_token", "").lower() == clean and c.get("status") == "aktiv":
-            return cid, c
-    return None, None
-
-
-# ═══════════════════════════════════════════════════════
-#   KUNDEN-PORTAL — CSS
-# ═══════════════════════════════════════════════════════
-_PORTAL_CSS = """
-/* ── Reset & Tokens ──────────────────────────────────── */
-:root {
-  --blue:        #3D4EC5;
-  --blue-light:  #5a6de8;
-  --blue-dim:    #1e255c;
-  --red:         #B82238;
-  --bg:          #080c1a;
-  --bg2:         #0d1225;
-  --surface:     #111827;
-  --surface2:    #161f35;
-  --border:      #1e2d52;
-  --border-light:#283660;
-  --text:        #e8eaf6;
-  --text-dim:    #a8b0cc;
-  --muted:       #5a6585;
-  --green:       #34d399;
-  --green-dim:   #0d2e22;
-  --amber:       #fbbf24;
-  --amber-dim:   #2d1f06;
-  --red-bright:  #f87171;
-  --red-dim:     #2d0a0a;
-  --radius:      12px;
-  --radius-sm:   8px;
-}
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { scroll-behavior: smooth; }
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
-  font-size: 15px;
-  line-height: 1.55;
-  min-height: 100vh;
-}
-a { color: var(--blue-light); text-decoration: none; }
-
-/* ── Layout ─────────────────────────────────────────── */
-.layout { display: flex; min-height: 100vh; }
-
-/* ── Sidebar ─────────────────────────────────────────── */
-.sidebar {
-  width: 240px;
-  flex-shrink: 0;
-  background: var(--bg2);
-  border-right: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  position: sticky;
-  top: 0;
-  height: 100vh;
-  overflow-y: auto;
-}
-.sidebar-logo {
-  padding: 24px 20px 20px;
-  border-bottom: 1px solid var(--border);
-}
-.sidebar-logo .wordmark {
-  font-size: 20px;
-  font-weight: 900;
-  letter-spacing: -0.5px;
-  color: var(--text);
-}
-.sidebar-logo .wordmark span { color: var(--blue-light); }
-.sidebar-logo .tagline {
-  font-size: 11px;
-  color: var(--muted);
-  margin-top: 3px;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-}
-.sidebar-nav { padding: 12px 10px; flex: 1; }
-.nav-section {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 1.5px;
-  text-transform: uppercase;
-  color: var(--muted);
-  padding: 12px 10px 6px;
-}
-.nav-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 12px;
-  border-radius: var(--radius-sm);
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--text-dim);
-  cursor: pointer;
-  transition: all .15s;
-  border: none;
-  background: none;
-  width: 100%;
-  text-align: left;
-}
-.nav-item:hover { background: var(--surface); color: var(--text); }
-.nav-item.active {
-  background: var(--blue-dim);
-  color: var(--blue-light);
-  font-weight: 600;
-}
-.nav-icon {
-  width: 18px;
-  height: 18px;
-  flex-shrink: 0;
-  opacity: .7;
-}
-.nav-item.active .nav-icon { opacity: 1; }
-.nav-badge {
-  margin-left: auto;
-  background: var(--blue-dim);
-  color: var(--blue-light);
-  font-size: 11px;
-  font-weight: 700;
-  padding: 1px 7px;
-  border-radius: 99px;
-}
-.nav-badge.red { background: var(--red-dim); color: var(--red-bright); }
-.sidebar-footer {
-  padding: 16px 20px;
-  border-top: 1px solid var(--border);
-  font-size: 11px;
-  color: var(--muted);
-  line-height: 1.6;
-}
-
-/* ── Main Content ────────────────────────────────────── */
-.main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-}
-.topbar {
-  background: var(--bg2);
-  border-bottom: 1px solid var(--border);
-  padding: 14px 28px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  position: sticky;
-  top: 0;
-  z-index: 10;
-  backdrop-filter: blur(10px);
-}
-.topbar-left { font-size: 16px; font-weight: 700; }
-.topbar-right {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-.topbar-time { font-size: 12px; color: var(--muted); }
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--green);
-  box-shadow: 0 0 6px var(--green);
-  flex-shrink: 0;
-}
-.content { padding: 28px; max-width: 900px; }
-
-/* ── Tab panels ──────────────────────────────────────── */
-.tab-panel { display: none; }
-.tab-panel.active { display: block; }
-
-/* ── Page header ─────────────────────────────────────── */
-.page-header {
-  margin-bottom: 24px;
-}
-.page-title { font-size: 22px; font-weight: 800; }
-.page-sub { font-size: 13px; color: var(--muted); margin-top: 3px; }
-
-/* ── Hero card ───────────────────────────────────────── */
-.hero {
-  background: linear-gradient(135deg, #111827 0%, #151f3a 60%, #1a2550 100%);
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius);
-  padding: 24px;
-  margin-bottom: 20px;
-  position: relative;
-  overflow: hidden;
-}
-.hero::before {
-  content: '';
-  position: absolute;
-  top: -60px; right: -60px;
-  width: 200px; height: 200px;
-  background: radial-gradient(circle, rgba(61,78,197,.25) 0%, transparent 70%);
-  pointer-events: none;
-}
-.hero-inner { display: flex; align-items: center; gap: 18px; }
-.hero-avatar {
-  width: 60px; height: 60px;
-  border-radius: 14px;
-  background: linear-gradient(135deg, var(--blue), #7c8ef0);
-  display: flex; align-items: center; justify-content: center;
-  font-size: 22px; font-weight: 900; color: #fff;
-  flex-shrink: 0;
-  box-shadow: 0 4px 20px rgba(61,78,197,.4);
-}
-.hero-name { font-size: 20px; font-weight: 800; }
-.hero-meta {
-  display: flex;
-  gap: 16px;
-  margin-top: 6px;
-  flex-wrap: wrap;
-}
-.hero-meta-item { font-size: 12px; color: var(--text-dim); }
-.hero-meta-item code {
-  background: var(--surface2);
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 12px;
-  color: var(--blue-light);
-}
-.hero-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  background: rgba(52,211,153,.1);
-  border: 1px solid rgba(52,211,153,.25);
-  color: var(--green);
-  font-size: 11px;
-  font-weight: 700;
-  padding: 3px 10px;
-  border-radius: 99px;
-  margin-top: 8px;
-}
-
-/* ── Stat cards ──────────────────────────────────────── */
-.stats-row {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
-  margin-bottom: 20px;
-}
-.stat-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 18px;
-  position: relative;
-  overflow: hidden;
-}
-.stat-card::after {
-  content: '';
-  position: absolute;
-  bottom: 0; left: 0; right: 0;
-  height: 2px;
-  background: linear-gradient(90deg, var(--blue), transparent);
-}
-.stat-val {
-  font-size: 26px;
-  font-weight: 900;
-  line-height: 1;
-  margin-bottom: 6px;
-}
-.stat-lbl {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 1px;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-.stat-trend {
-  font-size: 12px;
-  color: var(--green);
-  margin-top: 4px;
-}
-
-/* ── Section ─────────────────────────────────────────── */
-.section { margin-bottom: 28px; }
-.section-label {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 1.5px;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 14px;
-}
-
-/* ── Data card ───────────────────────────────────────── */
-.data-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  overflow: hidden;
-  margin-bottom: 12px;
-}
-.data-card-header {
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.data-card-title {
-  font-size: 15px;
-  font-weight: 700;
-}
-.data-card-body { padding: 20px; }
-.data-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 20px;
-}
-.data-field-lbl {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: .8px;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 5px;
-}
-.data-field-val {
-  font-size: 16px;
-  font-weight: 700;
-}
-.data-field-val code {
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  padding: 4px 10px;
-  border-radius: 6px;
-  font-size: 14px;
-  color: var(--blue-light);
-  font-weight: 600;
-}
-
-/* ── Insurance card ──────────────────────────────────── */
-.ins-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 20px;
-  margin-bottom: 12px;
-  transition: border-color .2s;
-}
-.ins-card:hover { border-color: var(--border-light); }
-.ins-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  margin-bottom: 16px;
-}
-.ins-name { font-size: 15px; font-weight: 700; }
-.ins-price { font-size: 13px; color: var(--text-dim); margin-top: 2px; }
-.ins-limit-badge {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-dim);
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  padding: 4px 10px;
-  border-radius: 6px;
-  white-space: nowrap;
-}
-.progress-track {
-  height: 6px;
-  background: var(--bg);
-  border-radius: 99px;
-  overflow: hidden;
-  margin-bottom: 10px;
-}
-.progress-fill {
-  height: 100%;
-  border-radius: 99px;
-  background: linear-gradient(90deg, var(--blue), var(--blue-light));
-  transition: width 1s cubic-bezier(.4,0,.2,1);
-}
-.progress-fill.warn  { background: linear-gradient(90deg, var(--amber), #f59e0b); }
-.progress-fill.full  { background: linear-gradient(90deg, var(--red), #f87171); }
-.progress-labels {
-  display: flex;
-  justify-content: space-between;
-  font-size: 12px;
-  color: var(--text-dim);
-}
-.progress-labels strong { color: var(--text); }
-
-/* ── Table ───────────────────────────────────────────── */
-.table-wrap {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-table { width: 100%; border-collapse: collapse; font-size: 14px; }
-thead th {
-  text-align: left;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 1.2px;
-  text-transform: uppercase;
-  color: var(--muted);
-  padding: 12px 16px;
-  background: var(--surface2);
-  border-bottom: 1px solid var(--border);
-}
-tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
-tbody tr:last-child { border-bottom: none; }
-tbody tr:hover { background: var(--surface2); }
-td { padding: 12px 16px; color: var(--text); vertical-align: middle; }
-td code {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  padding: 2px 7px;
-  border-radius: 5px;
-  font-size: 12px;
-  color: var(--blue-light);
-}
-
-/* ── Badges ──────────────────────────────────────────── */
-.badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 9px;
-  border-radius: 99px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .3px;
-  white-space: nowrap;
-}
-.badge-green  { background: var(--green-dim);  color: var(--green); }
-.badge-amber  { background: var(--amber-dim);  color: var(--amber); }
-.badge-red    { background: var(--red-dim);    color: var(--red-bright); }
-.badge-blue   { background: var(--blue-dim);   color: var(--blue-light); }
-.badge-dot {
-  width: 5px; height: 5px;
-  border-radius: 50%;
-  background: currentColor;
-}
-
-/* ── Empty state ─────────────────────────────────────── */
-.empty {
-  text-align: center;
-  padding: 48px 24px;
-  color: var(--muted);
-  font-size: 14px;
-}
-.empty-icon {
-  font-size: 32px;
-  margin-bottom: 12px;
-  opacity: .4;
-}
-
-/* ── Responsive ──────────────────────────────────────── */
-@media (max-width: 768px) {
-  .sidebar { display: none; }
-  .stats-row { grid-template-columns: 1fr 1fr; }
-  .data-grid { grid-template-columns: 1fr; }
-  .content { padding: 16px; }
-  .hero-inner { flex-direction: column; align-items: flex-start; }
-}
-@media (max-width: 480px) {
-  .stats-row { grid-template-columns: 1fr; }
-}
-"""
-
-_LOGIN_CSS = """
-:root{--blue:#3D4EC5;--bg:#0b0f1e;--card:#131929;--border:#232d50;
-  --text:#e8eaf6;--muted:#8892b0;}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;
-  min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:16px;
-  padding:40px;width:100%;max-width:420px}
-.logo{font-size:28px;font-weight:900;letter-spacing:-1px;margin-bottom:6px}
-.logo span{color:var(--blue)}
-.sub{color:var(--muted);font-size:14px;margin-bottom:28px}
-label{font-size:13px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px}
-input{width:100%;background:#0b0f1e;border:1px solid var(--border);border-radius:8px;
-  padding:12px 14px;color:var(--text);font-size:15px;outline:none;
-  transition:border-color .15s}
-input:focus{border-color:var(--blue)}
-.btn{display:block;width:100%;margin-top:16px;padding:13px;
-  background:var(--blue);color:#fff;font-size:15px;font-weight:700;
-  border:none;border-radius:8px;cursor:pointer;transition:opacity .15s}
-.btn:hover{opacity:.85}
-.err{background:#2a0a0a;border:1px solid #5a1010;border-radius:8px;
-  padding:12px;color:#f87171;font-size:13px;margin-bottom:16px}
-.info{margin-top:24px;padding:14px;background:#0d1020;border-radius:8px;
-  font-size:13px;color:var(--muted);line-height:1.6;border:1px solid var(--border)}
-"""
-
-
-# ═══════════════════════════════════════════════════════
-#   KUNDEN-PORTAL — Dashboard HTML Builder
-# ═══════════════════════════════════════════════════════
-def build_portal_dashboard(customer_id: str, customer: dict, token: str) -> str:
-    ins_types = get_insurance_types()
-    auszahlungen = customer.get("auszahlungen", {})
-    vers = customer.get("versicherungen", [])
-    invoices = sorted(
-        [
-            (iid, inv)
-            for iid, inv in data["invoices"].items()
-            if inv.get("customer_id") == customer_id
-        ],
-        key=lambda x: x[1].get("created_at", ""),
-        reverse=True,
-    )
-    schaden = sorted(
-        data.get("schaden_historie", {}).get(customer_id, []),
-        key=lambda x: x.get("datum", ""),
-        reverse=True,
-    )
-    initials = "".join(w[0].upper() for w in customer.get("rp_name", "?").split()[:2])
-
-    total_limit = sum(ins_types.get(i, {}).get("auszahlung_limit", 0.0) for i in vers)
-    total_paid = sum(auszahlungen.get(i, 0.0) for i in vers)
-    total_avail = max(0.0, total_limit - total_paid)
-    pct_used = min(100, int(total_paid / total_limit * 100)) if total_limit > 0 else 0
-    open_inv = sum(1 for _, inv in invoices if not inv.get("paid"))
-    since = (
-        make_aware(datetime.fromisoformat(customer["created_at"])).strftime("%d.%m.%Y")
-        if customer.get("created_at")
-        else "—"
-    )
-
-    # Pre-compute conditional HTML fragments (avoid complex f-string nesting)
-    inv_badge_cls = "nav-badge red" if open_inv > 0 else "nav-badge"
-    open_inv_style = 'style="color:var(--amber)"' if open_inv > 0 else ""
-    pct_bar_cls = "progress-fill warn" if pct_used >= 60 else "progress-fill"
-
-    # ── Insurance cards ───────────────────────────────────────────────────────
-    ins_html = ""
-    for ins in vers:
-        limit = ins_types.get(ins, {}).get("auszahlung_limit", 0.0)
-        price = ins_types.get(ins, {}).get("price", 0.0)
-        ausgezahlt = auszahlungen.get(ins, 0.0)
-        verfügbar = max(0.0, limit - ausgezahlt)
-        pct = min(100, int(ausgezahlt / limit * 100)) if limit > 0 else 0
-        bar_cls = (
-            "progress-fill full"
-            if pct >= 90
-            else ("progress-fill warn" if pct >= 60 else "progress-fill")
-        )
-        avail_style = 'style="color:var(--red-bright)"' if pct >= 90 else ""
-        ins_html += f"""
-        <div class="ins-card">
-          <div class="ins-header">
-            <div>
-              <div class="ins-name">{_esc(ins)}</div>
-              <div class="ins-price">{price:,.2f} EUR / Monat</div>
-            </div>
-            <div class="ins-limit-badge">Limit: {limit:,.0f} EUR</div>
-          </div>
-          <div class="progress-track">
-            <div class="{bar_cls}" style="width:{pct}%"></div>
-          </div>
-          <div class="progress-labels">
-            <span>Ausgezahlt: <strong>{ausgezahlt:,.2f} EUR</strong></span>
-            <span {avail_style}>Verfügbar: <strong>{verfügbar:,.2f} EUR</strong></span>
-          </div>
-        </div>"""
-
-    if not ins_html:
-        ins_html = '<div class="empty"><div class="empty-icon">*</div>Keine aktiven Versicherungen.</div>'
-
-    # ── Invoice table ─────────────────────────────────────────────────────────
-    if not invoices:
-        inv_html = '<div class="empty"><div class="empty-icon">-</div>Keine Rechnungen vorhanden.</div>'
-    else:
-        rows = ""
-        for iid, inv in invoices[:25]:
-            try:
-                due_dt = make_aware(datetime.fromisoformat(inv["due_date"]))
-                due = due_dt.strftime("%d.%m.%Y")
-            except Exception:
-                due_dt = get_now()
-                due = "—"
-            if inv.get("paid"):
-                badge = '<span class="badge badge-green"><span class="badge-dot"></span>Bezahlt</span>'
-            elif due_dt < get_now():
-                badge = '<span class="badge badge-red"><span class="badge-dot"></span>Ueberfällig</span>'
-            else:
-                badge = '<span class="badge badge-amber"><span class="badge-dot"></span>Ausstehend</span>'
-            mahn = inv.get("reminder_count", 0)
-            mahn_tx = (
-                f' <span class="badge badge-red">Mahnstufe {mahn}</span>'
-                if mahn > 0
-                else ""
-            )
-            rows += f"""<tr>
-              <td><code>{_esc(iid)}</code></td>
-              <td style="font-weight:700">{inv.get("betrag", 0):,.2f} EUR</td>
-              <td>{due}</td>
-              <td>{badge}{mahn_tx}</td>
-            </tr>"""
-        inv_html = f"""<div class="table-wrap"><table>
-          <thead><tr><th>Rechnungsnr.</th><th>Betrag</th><th>Fällig am</th><th>Status</th></tr></thead>
-          <tbody>{rows}</tbody></table></div>"""
-
-    # ── Damage history ────────────────────────────────────────────────────────
-    if not schaden:
-        sch_html = '<div class="empty"><div class="empty-icon">-</div>Keine Schadensmeldungen vorhanden.</div>'
-    else:
-        rows = ""
-        for entry in schaden[:15]:
-            try:
-                datum = make_aware(datetime.fromisoformat(entry["datum"])).strftime(
-                    "%d.%m.%Y"
-                )
-            except Exception:
-                datum = "—"
-            badge = (
-                '<span class="badge badge-green"><span class="badge-dot"></span>Abgeschlossen</span>'
-                if entry.get("status") == "abgeschlossen"
-                else '<span class="badge badge-amber"><span class="badge-dot"></span>In Bearbeitung</span>'
-            )
-            rows += f"""<tr>
-              <td><code>{_esc(entry.get("id", "—"))}</code></td>
-              <td>{datum}</td>
-              <td>{_esc(entry.get("Geschädigter", "—"))}</td>
-              <td>{_esc(entry.get("Täter", "—"))}</td>
-              <td>{badge}</td>
-            </tr>"""
-        sch_html = f"""<div class="table-wrap"><table>
-          <thead><tr><th>Vorgang-Nr.</th><th>Datum</th><th>Geschädigter</th><th>Täter</th><th>Status</th></tr></thead>
-          <tbody>{rows}</tbody></table></div>"""
-
-    return f"""<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DVG Kundenportal &ndash; {_esc(customer["rp_name"])}</title>
-<style>{_PORTAL_CSS}</style>
-</head>
-<body>
-<div class="layout">
-  <aside class="sidebar">
-    <div class="sidebar-logo">
-      <div class="wordmark">D<span>V</span>G</div>
-      <div class="tagline">Kundenportal</div>
-    </div>
-    <nav class="sidebar-nav">
-      <div class="nav-section">Navigation</div>
-      <button class="nav-item active" onclick="showTab('Übersicht',this)">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
-          <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
-        </svg>Übersicht
-      </button>
-      <button class="nav-item" onclick="showTab('vers',this)">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-        </svg>Versicherungen<span class="nav-badge">{len(vers)}</span>
-      </button>
-      <button class="nav-item" onclick="showTab('inv',this)">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-          <polyline points="14 2 14 8 20 8"/>
-        </svg>Rechnungen
-        <span class="{inv_badge_cls}">{len(invoices)}</span>
-      </button>
-      <button class="nav-item" onclick="showTab('sch',this)">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="12" cy="12" r="10"/>
-          <line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-        </svg>Schadenhistorie<span class="nav-badge">{len(schaden)}</span>
-      </button>
-    </nav>
-    <div class="sidebar-footer">
-      InsuranceGuard v4<br>Copyright &copy; DVG<br>
-      Stand: {get_now().strftime("%d.%m.%Y %H:%M")} Uhr
-    </div>
-  </aside>
-
-  <div class="main">
-    <header class="topbar">
-      <div class="topbar-left">Guten Tag, {_esc(customer["rp_name"].split()[0])}</div>
-      <div class="topbar-right">
-        <div class="status-dot"></div>
-        <span class="topbar-time">{get_now().strftime("%d.%m.%Y %H:%M")} Uhr</span>
-      </div>
-    </header>
-
-    <div class="content">
-
-      <div id="tab-Übersicht" class="tab-panel active">
-        <div class="hero">
-          <div class="hero-inner">
-            <div class="hero-avatar">{_esc(initials)}</div>
-            <div>
-              <div class="hero-name">{_esc(customer["rp_name"])}</div>
-              <div class="hero-meta">
-                <span class="hero-meta-item">ID: <code>{_esc(customer_id)}</code></span>
-                <span class="hero-meta-item">Kunde seit: <code>{since}</code></span>
-                <span class="hero-meta-item">HBpay: <code>{_esc(customer.get("hbpay_nummer", "—"))}</code></span>
-              </div>
-              <div class="hero-badge">
-                <span class="badge-dot"></span> Aktiver Versicherungsnehmer
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="stats-row">
-          <div class="stat-card">
-            <div class="stat-val">{len(vers)}</div>
-            <div class="stat-lbl">Versicherungen</div>
-            <div class="stat-trend">Alle aktiv</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-val">{customer.get("total_monthly_price", 0):,.0f} EUR</div>
-            <div class="stat-lbl">Monatsbeitrag</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-val" {open_inv_style}>
-              {open_inv}
-            </div>
-            <div class="stat-lbl">Offene Rechnungen</div>
-          </div>
-        </div>
-
-        <div class="section">
-          <div class="section-label">Zahlungsdaten</div>
-          <div class="data-card">
-            <div class="data-card-body">
-              <div class="data-grid">
-                <div>
-                  <div class="data-field-lbl">HBpay Kontonummer</div>
-                  <div class="data-field-val"><code>{_esc(customer.get("hbpay_nummer", "—"))}</code></div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="section">
-          <div class="section-label">Gesamtes Auszahlungslimit</div>
-          <div class="data-card">
-            <div class="data-card-body">
-              <div class="data-grid">
-                <div>
-                  <div class="data-field-lbl">Limit gesamt</div>
-                  <div class="data-field-val">{total_limit:,.2f} EUR</div>
-                </div>
-                <div>
-                  <div class="data-field-lbl">Bereits ausgezahlt</div>
-                  <div class="data-field-val">{total_paid:,.2f} EUR</div>
-                </div>
-              </div>
-              <div style="margin-top:20px">
-                <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:8px">
-                  <span>Verbrauchtes Limit</span><span>{pct_used} %</span>
-                </div>
-                <div class="progress-track" style="height:8px">
-                  <div class="progress-fill" style="width:{pct_used}%"></div>
-                </div>
-                <div style="font-size:12px;color:var(--muted);margin-top:6px">
-                  {total_avail:,.2f} EUR verbleibend
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div id="tab-vers" class="tab-panel">
-        <div class="page-header">
-          <div class="page-title">Versicherungen</div>
-          <div class="page-sub">{len(vers)} aktive{"r" if len(vers) == 1 else ""} Versicherungsvertrag{"" if len(vers) == 1 else "e"}</div>
-        </div>
-        {ins_html}
-      </div>
-
-      <div id="tab-inv" class="tab-panel">
-        <div class="page-header">
-          <div class="page-title">Rechnungen</div>
-          <div class="page-sub">{len(invoices)} Rechnungen — {open_inv} offen</div>
-        </div>
-        {inv_html}
-      </div>
-
-      <div id="tab-sch" class="tab-panel">
-        <div class="page-header">
-          <div class="page-title">Schadenhistorie</div>
-          <div class="page-sub">{len(schaden)} Schadensmeldung{"" if len(schaden) == 1 else "en"}</div>
-        </div>
-        {sch_html}
-      </div>
-
-    </div>
-  </div>
-</div>
-
-<script>
-function showTab(id,el){{
-  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(b=>b.classList.remove('active'));
-  document.getElementById('tab-'+id).classList.add('active');
-  el.classList.add('active');
-}}
-window.addEventListener('load',()=>{{
-  document.querySelectorAll('.progress-fill').forEach(b=>{{
-    const w=b.style.width;b.style.width='0%';
-    setTimeout(()=>{{b.style.width=w;}},120);
-  }});
-}});
-</script>
-</body></html>"""
-
-
-# ═══════════════════════════════════════════════════════
-#   KUNDEN-PORTAL — Flask-Routen
-# ═══════════════════════════════════════════════════════
-@app_flask.route("/portal")
-def portal_landing():
-    err = ""
-    if request.args.get("error"):
-        err = '<div class="err">Ungultiger oder abgelaufener Zugangscode.</div>'
-    html = f"""<!DOCTYPE html>
-<html lang="de">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DVG Kundenportal</title><style>{_LOGIN_CSS}</style></head>
-<body>
-<div class="card">
-  <div class="logo">D<span>V</span>G</div>
-  <div class="sub">Kundenportal &ndash; Ihre Versicherungsübersicht</div>
-  {err}
-  <form method="POST" action="/portal/login">
-    <label>Zugangscode</label>
-    <input type="text" name="token" placeholder="Ihr persoenlicher Zugangscode" autofocus>
-    <button class="btn" type="submit">Zum Portal</button>
-  </form>
-  <div class="info">
-    Ihren Zugangscode erhalten Sie von einem DVG-Mitarbeiter per Direktnachricht im Discord-Server.
-  </div>
-</div>
-</body></html>"""
-    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
-
-
-@app_flask.route("/portal/login", methods=["POST"])
-def portal_login():
-    token = request.form.get("token", "").strip().lower()
-    cid, _ = get_customer_by_token(token)
-    if not cid:
-        return redirect("/portal?error=1")
-    return redirect(f"/portal/{token}")
-
-
-@app_flask.route("/portal/<token>")
-def portal_dashboard_route(token: str):
-    cid, customer = get_customer_by_token(token.lower())
-    if not cid:
-        return redirect("/portal?error=1")
-    return (
-        build_portal_dashboard(cid, customer, token),
-        200,
-        {"Content-Type": "text/html; charset=utf-8"},
-    )
-
-
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app_flask.run(host="0.0.0.0", port=port, use_reloader=False)
+    def log_message(self, *args):  # Konsole sauber halten
+        pass
 
 
 def keep_alive():
-    t = Thread(target=run_flask, daemon=True)
-    t.start()
+    """
+    Startet nur dann einen winzigen Health-Check-Server, wenn der Host einen
+    offenen Port erwartet (Umgebungsvariable PORT, z. B. Render Web Service).
+    Es gibt keine Webseite, kein Portal und keine Transcript-Links mehr.
+    """
+    port = os.environ.get("PORT")
+    if not port:
+        return
+    server = HTTPServer(("0.0.0.0", int(port)), _HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
 # ═══════════════════════════════════════════════════════
