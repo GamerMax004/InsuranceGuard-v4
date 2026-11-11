@@ -26,6 +26,11 @@ ADMIN_USER_IDS = [1211683189186105434]
 GERMANY_TZ = pytz.timezone("Europe/Berlin")
 
 
+def get_zahlungsmittel(customer: dict) -> str:
+    """Zahlungsmittel des Kunden (freier Text; ältere Akten nutzen noch den Schlüssel hbpay_nummer)."""
+    return str(customer.get("zahlungsmittel") or customer.get("hbpay_nummer") or "—")
+
+
 def get_now() -> datetime:
     return datetime.now(GERMANY_TZ)
 
@@ -71,7 +76,6 @@ DEFAULT_CONFIG = {
     "kundenkontakt_channel_id": None,
     "schadensmeldung_channel_id": None,
     "dokumentation_channel_id": None,
-    "steuer_prozent": 3.0,
     "guild_modules": {},
     "insurance_types": {
         "Krankenversicherung (Privat)": {
@@ -252,6 +256,7 @@ KUNDEN_ROLE_NAME = "Versicherungsnehmer"
 FOOTER_ICON = "https://images-ext-1.discordapp.net/external/ymktlgwOVtfgthFaYKgqoi_FnuvFhkhYFAT5Zri83Kw/%3Fsize%3D4096/https/cdn.discordapp.com/avatars/1494338524705718412/0bd737c851d6993ec6a38563bc3f2ee0.png?format=webp&quality=lossless&width=230&height=230"
 AUTOMOD_ICON = "https://media.discordapp.net/attachments/1473692441726029874/1473692787156455474/1072-automod.png?ex=699722dc&is=6995d15c&hm=08ad340d3673e1f1076cbf73d235ea3b0e8ef10b07abb8d24ea66d85c6b59edb&=&format=webp&quality=lossless&width=250&height=250"
 AUTHOR_ICON = "https://images-ext-1.discordapp.net/external/oaegfwZ-7BSrD3Q4oHp7bYcKEU4bzeHPyYOn-ePhVNM/%3Fsize%3D4096/https/cdn.discordapp.com/icons/1408794976615268384/70aeea0005d728278f7f78e94b580d45.png?format=webp&quality=lossless&width=624&height=624"
+STEUER_PROZENT = 19.0  # Umsatzsteuer: überall 19 %
 FOOTER_TEXT = "Copyright © InsuranceGuard v4"
 AUTHOR_NAME = "Deutsche Versicherungsgesellschaft"
 
@@ -282,10 +287,14 @@ class DEmbed(discord.Embed):
 
 
 def _unquote(text) -> str:
-    """Entfernt die alten Zitat-Präfixe '> ' (altes Embed-Design) zeilenweise."""
+    """Entfernt alte Zitat-Präfixe '> ' und wandelt `-` in Aufzählungspunkte um."""
     if text is None:
         return ""
-    lines = [re.sub(r"^\s*>\s?", "", ln) for ln in str(text).split("\n")]
+    lines = []
+    for ln in str(text).split("\n"):
+        ln = re.sub(r"^\s*>\s?", "", ln)
+        ln = re.sub(r"^`-`\s*", "• ", ln)
+        lines.append(ln)
     return "\n".join(lines).strip()
 
 
@@ -303,8 +312,18 @@ def _field_text(name: str, value: str) -> str:
     return f"**{name}:** {value}"
 
 
-def _ts_style(dt, style="f") -> str:
+def dts(dt, style: str = "f") -> str:
+    """Discord-Timestamp (wird im Client in der Zeitzone des Betrachters angezeigt)."""
     return f"<t:{int(dt.timestamp())}:{style}>"
+
+
+def dtd(dt) -> str:
+    """Discord-Timestamp nur mit Datum."""
+    return dts(dt, "d")
+
+
+def _ts_style(dt, style="f") -> str:
+    return dts(dt, style)
 
 
 def _split_rows(items) -> list:
@@ -322,16 +341,52 @@ def _split_rows(items) -> list:
     return rows[:5]
 
 
+def _sep(visible: bool = True) -> discord.ui.Separator:
+    return discord.ui.Separator(visible=visible, spacing=discord.SeparatorSpacing.small)
+
+
+def _is_short(value: str) -> bool:
+    return "\n" not in value and len(value) <= 80 and not value.startswith("```")
+
+
+def _add_divider(container: discord.ui.Container) -> None:
+    """Fügt eine sichtbare Trennlinie ein (nie am Anfang und nie doppelt)."""
+    last = container.children[-1] if container.children else None
+    if last is None or (isinstance(last, discord.ui.Separator) and last.visible):
+        return
+    container.add_item(_sep(True))
+
+
+def _tail_texts(hint: str, footer: Optional[str]) -> list:
+    out = []
+    if hint:
+        out.append(discord.ui.TextDisplay(hint))
+    if footer:
+        out.append(discord.ui.TextDisplay(footer))
+    return out
+
+
 def build_container(
     embed: Optional[discord.Embed],
     items=None,
     *,
     extra_files: Optional[List[str]] = None,
 ) -> discord.ui.Container:
-    """Wandelt ein (altes) Embed in einen EHRN-Container um."""
+    """
+    Wandelt ein (altes) Embed in einen EHRN-Container um.
+
+    Aufbau:  Überschrift (+ Kurzbeschreibung)
+             ─────────
+             Kerndaten (kurze Felder als Liste)
+             Abschnitte (lange Felder, je ein eigener Block)
+             ─────────
+             Buttons / Menüs
+             ─────────
+             Hinweis + Fußzeile
+    """
     color = DESIGN_COLOR
     heading = ""
-    body = ""
+    blocks: List[str] = []
     hint = ""
     show_footer = True
     stamp = None
@@ -339,59 +394,110 @@ def build_container(
     if embed is not None:
         if embed.color is not None and embed.color.value is not None:
             color = embed.color.value
-        is_error = color == COLOR_ERROR
-        show_footer = not is_error
+        show_footer = color != COLOR_ERROR
         big = bool(getattr(embed, "big", False))
         if embed.title:
             heading = f"{'##' if big else '###'} {str(embed.title).strip()}"
         desc = _unquote(embed.description)
-        field_blocks = [
-            t for t in (_field_text(f.name, f.value) for f in embed.fields) if t
-        ]
-        parts = []
         if desc:
-            parts.append(desc)
-        if field_blocks:
-            parts.append("\n\n".join(field_blocks))
-        body = "\n\n".join(parts)
+            if heading and "\n" not in desc and len(desc) <= 220:
+                heading += f"\n{desc}"
+            else:
+                blocks.append(desc)
+        kv: List[str] = []
+        for f in embed.fields:
+            val = _unquote(f.value)
+            txt = _field_text(f.name, f.value)
+            if not txt:
+                continue
+            is_status = str(f.name or "").strip().startswith("Status")
+            if _is_short(val) and "\n" not in txt and not is_status:
+                kv.append(txt)
+            else:
+                if kv:
+                    blocks.append("\n".join(kv))
+                    kv = []
+                blocks.append(txt)
+        if kv:
+            blocks.append("\n".join(kv))
         if embed.footer and embed.footer.text and embed.footer.text != FOOTER_TEXT:
             hint = f"-# {embed.footer.text.strip()}"
         if embed.timestamp and show_footer:
             stamp = embed.timestamp
 
-    # Sicherheitsnetz: Discord erlaubt max. 4.000 Zeichen Text je Nachricht
-    footer = f"-# {DESIGN_FOOTER}" + (f" · {_ts_style(stamp)}" if stamp else "")
-    budget = MAX_TEXT - len(heading) - len(hint) - len(footer) - 40
-    if len(body) > budget:
-        cut = body[:budget].rsplit("\n", 1)[0]
-        body = cut + "\n-# … weitere Einträge gekürzt"
+    footer = (
+        f"-# {DESIGN_FOOTER}" + (f" · {_ts_style(stamp)}" if stamp else "")
+        if show_footer
+        else None
+    )
+    if len(blocks) > 8:  # Komponenten-Limit: zu viele Abschnitte zusammenfassen
+        blocks = ["\n\n".join(blocks)]
+
+    def _total() -> int:
+        return (
+            len(heading) + sum(len(b) for b in blocks) + len(hint) + len(footer or "")
+        )
+
+    while (
+        blocks and _total() > MAX_TEXT
+    ):  # Discord: max. 4.000 Zeichen Text je Nachricht
+        over = _total() - MAX_TEXT
+        last = blocks[-1]
+        if len(last) > over + 80:
+            blocks[-1] = (
+                last[: len(last) - over - 60].rsplit("\n", 1)[0]
+                + "\n-# … weitere Einträge gekürzt"
+            )
+            break
+        blocks.pop()
 
     container = discord.ui.Container(accent_colour=color)
     if heading:
         container.add_item(discord.ui.TextDisplay(heading))
-    if heading and (body or items):
-        container.add_item(
-            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small)
-        )
-    if body:
-        container.add_item(discord.ui.TextDisplay(body))
+    rows = _split_rows(items or [])
+    if heading and (blocks or rows or extra_files):
+        container.add_item(_sep(True))
+    for i, block in enumerate(blocks):
+        if i:
+            container.add_item(_sep(False))
+        container.add_item(discord.ui.TextDisplay(block))
     for fname in extra_files or []:
         container.add_item(discord.ui.File(f"attachment://{fname}"))
-    rows = _split_rows(items or [])
     if rows:
-        if body:
-            container.add_item(
-                discord.ui.Separator(
-                    visible=True, spacing=discord.SeparatorSpacing.small
-                )
-            )
+        _add_divider(container)
         for row in rows:
             container.add_item(row)
-    if hint:
-        container.add_item(discord.ui.TextDisplay(hint))
-    if show_footer:
-        container.add_item(discord.ui.TextDisplay(footer))
+    tail = _tail_texts(hint, footer)
+    if tail:
+        _add_divider(container)
+        for t in tail:
+            container.add_item(t)
     return container
+
+
+def _reassemble(top: discord.ui.Container, rows: list) -> None:
+    """Ersetzt die Buttonzeilen eines bestehenden Containers (Text, Hinweis, Fußzeile bleiben)."""
+    children = [c for c in top.children if not isinstance(c, discord.ui.ActionRow)]
+    tail = []
+    while (
+        children
+        and isinstance(children[-1], discord.ui.TextDisplay)
+        and children[-1].content.startswith("-#")
+    ):
+        tail.insert(0, children.pop())
+    while children and isinstance(children[-1], discord.ui.Separator):
+        children.pop()  # Trennlinie vor Buttons bzw. Fußzeile
+    top.clear_items()
+    for c in children:
+        top.add_item(c)
+    if rows:
+        _add_divider(top)
+        for row in rows:
+            top.add_item(row)
+    if tail:
+        _add_divider(top)
+        for t in tail:
+            top.add_item(t)
 
 
 class EView(discord.ui.LayoutView):
@@ -534,34 +640,7 @@ def ev_msg(message: discord.Message, view: EView) -> dict:
         layout = discord.ui.LayoutView.from_message(message, timeout=view.timeout)
         for top in list(layout.children):
             if isinstance(top, discord.ui.Container):
-                for child in list(top.children):
-                    if isinstance(child, discord.ui.ActionRow):
-                        top.remove_item(child)
-                rows = _split_rows(view.controls)
-                # Reihen vor Hinweis/Fußzeile (die letzten TextDisplays) einfügen
-                texts_tail = []
-                while (
-                    top.children
-                    and isinstance(top.children[-1], discord.ui.TextDisplay)
-                    and len(texts_tail) < 2
-                    and top.children[-1].content.startswith("-#")
-                ):
-                    texts_tail.insert(0, top.children[-1])
-                    top.remove_item(top.children[-1])
-                if rows:
-                    if not (
-                        top.children
-                        and isinstance(top.children[-1], discord.ui.Separator)
-                    ):
-                        top.add_item(
-                            discord.ui.Separator(
-                                visible=True, spacing=discord.SeparatorSpacing.small
-                            )
-                        )
-                    for row in rows:
-                        top.add_item(row)
-                for t in texts_tail:
-                    top.add_item(t)
+                _reassemble(top, _split_rows(view.controls))
                 break
         kwargs["view"] = layout
         return kwargs
@@ -596,7 +675,7 @@ def restyle(
 ) -> dict:
     """
     Ändert eine bestehende Bot-Nachricht (Status-Updates).
-    fields: Liste von (Präfix, Name, Wert) — ersetzt den Feld-Block, der mit **Präfix
+    fields: Liste von (Präfix, Name, Wert) — ersetzt die Zeile/den Block, der mit **Präfix
     beginnt, oder hängt ihn an. Funktioniert für V2-Nachrichten und alte Embed-Nachrichten.
     """
     fields = fields or []
@@ -607,34 +686,42 @@ def restyle(
                 continue
             if color is not None:
                 top.accent_colour = color
-            if drop_controls:
-                for child in list(top.children):
-                    if isinstance(child, discord.ui.ActionRow):
-                        top.remove_item(child)
             texts = [c for c in top.children if isinstance(c, discord.ui.TextDisplay)]
             body_candidates = [
                 t for t in texts if not t.content.startswith(("#", "-#"))
             ]
-            body = (
-                max(body_candidates, key=lambda t: len(t.content))
-                if body_candidates
-                else None
-            )
             for prefix, name, value in fields:
                 new_block = _field_text(name, value)
                 done = False
                 for t in texts:
+                    if t.content.startswith("-#"):
+                        continue
                     blocks = t.content.split("\n\n")
-                    for i, blk in enumerate(blocks):
-                        if blk.lstrip().startswith(f"**{prefix}"):
-                            blocks[i] = new_block
-                            t.content = "\n\n".join(blocks)
-                            done = True
+                    for bi, blk in enumerate(blocks):
+                        lines = blk.split("\n")
+                        for li, ln in enumerate(lines):
+                            if ln.lstrip().startswith(f"**{prefix}"):
+                                # Zeile samt eventueller Folgezeilen dieses Feldes ersetzen
+                                end = li + 1
+                                while end < len(lines) and not lines[
+                                    end
+                                ].lstrip().startswith("**"):
+                                    end += 1
+                                lines[li:end] = new_block.split("\n")
+                                blocks[bi] = "\n".join(lines)
+                                done = True
+                                break
+                        if done:
                             break
                     if done:
+                        t.content = "\n\n".join(blocks)
                         break
-                if not done and body is not None:
-                    body.content = f"{body.content}\n\n{new_block}"
+                if not done and body_candidates:
+                    last = body_candidates[-1]
+                    sep = "\n" if "\n" not in new_block else "\n\n"
+                    last.content = f"{last.content}{sep}{new_block}"
+            if drop_controls:
+                _reassemble(top, [])
             break
         return {"view": layout, "allowed_mentions": NO_MENTIONS}
     # Alte Embed-Nachricht → ins neue Design überführen
@@ -1183,7 +1270,7 @@ async def close_ticket_channel(
     ticket_info: dict,
     auto_close: bool = False,
 ) -> None:
-    closer_mention = interaction.user.mention if interaction else "System System"
+    closer_mention = interaction.user.mention if interaction else "System"
     closer_id = getattr(interaction.user, "id", 0) if interaction else 0
 
     if interaction and not interaction.response.is_done():
@@ -1383,14 +1470,14 @@ async def _send_inactivity_warning(
         description=(
             "> Dieses Ticket ist seit **16 Stunden** inaktiv.\n"
             "> Es wird **automatisch geschlossen**, wenn keine Reaktion erfolgt.\n"
-            "> Klicke auf den Button, um das automatische Schließen abzubrechen."
+            "> Klicken Sie auf den Button, um das automatische Schließen abzubrechen."
         ),
         color=EMBED_COLOR,
         timestamp=get_now(),
     )
     warn_embed.add_field(
         name="Automatisches Schließen um",
-        value=f"> `{auto_close_time.strftime('%d.%m.%Y, %H:%M Uhr')}`",
+        value=f"> {dts(auto_close_time)}",
         inline=False,
     )
 
@@ -1480,7 +1567,7 @@ def customer_has_active_ticket(customer_id: str, ticket_type: str) -> Optional[i
 
 def check_nachweis_duplicate(nachweis: str) -> Optional[dict]:
     """
-    Prüft ob ein Schadennachweis (Link / Rechnungsnr.) bereits eingereicht wurde.
+    Prüft ob ein Schadensnachweis (Link / Rechnungsnr.) bereits eingereicht wurde.
     Gibt den Historieneintrag zurück, wenn ein Duplikat gefunden wird.
     """
     clean = nachweis.strip().lower()
@@ -1582,7 +1669,7 @@ async def send_invoice_due_dm(guild: discord.Guild, invoice_id: str, inv: dict):
     member = guild.get_member(customer.get("discord_user_id", 0))
     if not member:
         return
-    due = make_aware(datetime.fromisoformat(inv["due_date"])).strftime("%d.%m.%Y")
+    due = dtd(make_aware(datetime.fromisoformat(inv["due_date"])))
     dm = dvg_embed(
         "Zahlungserinnerung",
         f"> Ihre Versicherungsrechnung ist in **24 Stunden** fällig.\n"
@@ -1592,10 +1679,10 @@ async def send_invoice_due_dm(guild: discord.Guild, invoice_id: str, inv: dict):
     dm.add_field(
         name="Betrag", value=f"> `{inv.get('betrag', 0):,.2f} EUR`", inline=True
     )
-    dm.add_field(name="Fällig am", value=f"> `{due}`", inline=True)
+    dm.add_field(name="Fällig am", value=f"> {due}", inline=True)
     dm.add_field(
-        name="Zahlungsmethode",
-        value=f"> HBpay: `{customer.get('hbpay_nummer', '—')}`",
+        name="Zahlungsmittel",
+        value=f"> `{get_zahlungsmittel(customer)}`",
         inline=False,
     )
     try:
@@ -1676,8 +1763,8 @@ def build_kundenakte_embed(customer_id: str, customer: dict) -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="Zahlungsmethode",
-        value=f"> <:hbpay:1522597775647178905> `{customer['hbpay_nummer']}`",
+        name="Zahlungsmittel",
+        value=f"> <:hbpay:1522597775647178905> `{get_zahlungsmittel(customer)}`",
         inline=False,
     )
     ins_text = "\n".join(
@@ -1691,7 +1778,7 @@ def build_kundenakte_embed(customer_id: str, customer: dict) -> discord.Embed:
     )
     embed.add_field(
         name="Gesamtbeitrag (monatlich)",
-        value=f"> <:einzahlung:1522597871051079710> `{total_price:,.2f}€/Monat` zzgl. 19% Steuern",
+        value=f"> <:einzahlung:1522597871051079710> `{total_price:,.2f}€/Monat` zzgl. 19 % Steuern",
         inline=False,
     )
     return embed
@@ -1767,7 +1854,7 @@ async def update_customer_thread_backup(guild: discord.Guild, customer_id: str):
         )
         embed.add_field(
             name="Stand",
-            value=f"> {get_now().strftime('%d.%m.%Y, %H:%M Uhr')}",
+            value=f"> {dts(get_now())}",
             inline=True,
         )
 
@@ -1788,7 +1875,6 @@ MODUL_COMMANDS = {
         "kunden-suchen",
         "versicherung-kuendigen",
         "rechnungen-uebersicht",
-        "einstellung-steuer",
         "einstellung-versicherung-neu",
         "einstellung-versicherung-edit",
         "einstellung-versicherungen-liste",
@@ -1964,7 +2050,7 @@ async def ping(interaction: discord.Interaction):
     )
     embed.add_field(
         name="Serverzeit",
-        value=f"> {get_now().strftime('%d.%m.%Y, %H:%M Uhr')}",
+        value=f"> {dts(get_now())}",
         inline=False,
     )
     await interaction.response.send_message(ephemeral=True, **ev(embed))
@@ -2132,7 +2218,7 @@ async def reload_backup(interaction: discord.Interaction, datei: discord.Attachm
     name="kunden-suchen",
     description="Sucht nach Kunden anhand des RP-Namens oder der Kunden-ID",
 )
-@app_commands.describe(suchbegriff="RP-Name, Kunden-ID oder Kartennummer")
+@app_commands.describe(suchbegriff="RP-Name, Kunden-ID oder Zahlungsmittel")
 async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
@@ -2154,7 +2240,7 @@ async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
             for cid, c in data["customers"].items()
             if q in cid.lower()
             or q in c.get("rp_name", "").lower()
-            or q in c.get("hbpay_nummer", "").lower()
+            or q in get_zahlungsmittel(c).lower()
         ]
         if not treffer:
             embed = DEmbed(
@@ -2165,7 +2251,7 @@ async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
             )
             embed.add_field(
                 name="Suchtipps",
-                value="> `-` Kunden-ID: `VN-26123456`\n> `-` RP-Name: `Max Mustermann`\n> `-` Kartennummer",
+                value="> `-` Kunden-ID: `VN-26123456`\n> `-` RP-Name: `Max Mustermann`\n> `-` Zahlungsmittel",
                 inline=False,
             )
             await interaction.followup.send(ephemeral=True, **ev(embed))
@@ -2192,7 +2278,7 @@ async def kunden_suchen(interaction: discord.Interaction, suchbegriff: str):
                 name=f"{c['rp_name']}",
                 value=(
                     f"> <:id:1522597735205830666> `{cid}`\n"
-                    f"> <:hbpay:1522597775647178905> `{c['hbpay_nummer']}`\n"
+                    f"> <:hbpay:1522597775647178905> `{get_zahlungsmittel(c)}`\n"
                     f"> {status_text}\n"
                     f"> <:6509addguild:1522597829917413396> `{c.get('total_monthly_price', 0):,.2f}€/Monat`\n"
                     + versicherungen[:200]
@@ -2324,7 +2410,7 @@ async def versicherung_kündigen(interaction: discord.Interaction, customer_id: 
         singular = fehlende == 1
         e = dvg_embed(
             "Mindestlaufzeit — Kündigung nicht möglich!",
-            f"> Versicherungen können erst nach **4 geleisteten Monatsbeiträgen** gekündigt werden. "
+            f"> Versicherungen können erst nach **4 geleisteten Monatsbeiträgen** gekündigt werden.\n"
             f"> Diese Regelung schützt vor missbräuchlicher Nutzung des Versicherungsschutzes.",
         )
         e.add_field(
@@ -2590,7 +2676,7 @@ async def rechnungen_Übersicht(
                 value=(
                     f"> `-` {cust.get('rp_name', '—')}\n"
                     f"> `-` `{inv['betrag']:,.2f}€`\n"
-                    f"> Fällig: `{due.strftime('%d.%m.%Y')}`\n"
+                    f"> Fällig: {dtd(due)}\n"
                     f">  {status_text}"
                     + (f"\n> Mahnstufe: `{mahn}`" if mahn > 0 else "")
                 ),
@@ -2610,40 +2696,6 @@ async def rechnungen_Übersicht(
 # ═══════════════════════════════════════════════════════
 #   ADMIN EINSTELLUNGEN
 # ═══════════════════════════════════════════════════════
-@bot.tree.command(
-    name="einstellung-steuer",
-    description="[ADMIN] Setzt den globalen Steuersatz für Rechnungen",
-)
-@app_commands.describe(prozent="Steuersatz in Prozent (z.B. 5.0)")
-async def set_steuer(interaction: discord.Interaction, prozent: float):
-    if not is_admin(interaction):
-        await interaction.response.send_message(
-            ephemeral=True,
-            **ev(
-                build_error_embed(
-                    "Zugriff verweigert!", "Nur Administratoren.", "Administrator"
-                )
-            ),
-        )
-        return
-    if not (0 <= prozent <= 100):
-        await interaction.response.send_message(
-            ephemeral=True, **ev(build_error_embed("Ungültiger Wert!", "0–100."))
-        )
-        return
-    config["steuer_prozent"] = prozent
-    save_config(config)
-    e = DEmbed(
-        title="Steuersatz aktualisiert!",
-        description=f"> Neuer Steuersatz: **`{prozent}%`**",
-        color=EMBED_COLOR,
-    )
-    await interaction.response.send_message(ephemeral=True, **ev(e))
-    add_log_entry(
-        "STEUERSATZ_GEAENDERT", interaction.user.id, {"neuer_steuersatz": prozent}
-    )
-
-
 @bot.tree.command(
     name="einstellung-versicherung-neu",
     description="[ADMIN] Fügt eine neue Versicherungsart hinzu",
@@ -2775,7 +2827,7 @@ async def list_versicherungen(interaction: discord.Interaction):
     e = dvg_embed("Versicherungskonfiguration")
     e.add_field(
         name="Steuersatz",
-        value=f"> `{config.get('steuer_prozent', 3.0)}%`",
+        value=f"> `{STEUER_PROZENT:g} %`",
         inline=False,
     )
     for name, v in config.get("insurance_types", {}).items():
@@ -2887,7 +2939,7 @@ async def set_channels(
         changes.append(f"Log-Kanal: {log_channel.mention}")
     if auszahlung_kanal:
         config["auszahlung_channel_id"] = auszahlung_kanal.id
-        changes.append(f"Auszahlungs-Kanal: {auszahlung_kanal.mention}")
+        changes.append(f"Auszahlungskanal: {auszahlung_kanal.mention}")
     if dokumentation_kanal:
         config["dokumentation_channel_id"] = dokumentation_kanal.id
         changes.append(f"Dokumentations-Kanal: {dokumentation_kanal.mention}")
@@ -2903,7 +2955,7 @@ async def set_channels(
             config["kundenkontakt_channel_id"] = kundenkontakt_panel.id
             embed_kk = dvg_embed(
                 "Kundenkontakt",
-                "Liebe Mitarbeiter:innen,\n> hier können sie mit unseren Kunden Kontakt aufnehmen.",
+                "Liebe Mitarbeiter:innen,\n> hier können Sie mit unseren Kunden Kontakt aufnehmen.",
             )
             embed_kk.add_field(
                 name="Wie funktioniert das System?",
@@ -3076,14 +3128,14 @@ class AddInsuranceView(EView):
     forum_channel="Forum-Channel für Kundenakten",
     user="Discord-User des Versicherungsnehmers",
     rp_name="RP-Name",
-    hbpay_nummer="HBpay Kontonummer",
+    zahlungsmittel="Zahlungsmittel des Kunden (frei wählbar, z. B. Kontonummer, Karte oder Bar)",
 )
 async def create_customer(
     interaction: discord.Interaction,
     forum_channel: discord.ForumChannel,
     user: discord.Member,
     rp_name: str,
-    hbpay_nummer: str,
+    zahlungsmittel: str,
 ):
     if not is_mitarbeiter(interaction):
         await interaction.response.send_message(
@@ -3120,7 +3172,7 @@ async def create_customer(
         total_price = sum(ins_types[ins]["price"] for ins in ins_list)
         customer_data = {
             "rp_name": rp_name,
-            "hbpay_nummer": hbpay_nummer,
+            "zahlungsmittel": zahlungsmittel,
             "versicherungen": ins_list,
             "total_monthly_price": total_price,
             "thread_id": None,
@@ -3132,7 +3184,7 @@ async def create_customer(
         }
         embed = build_kundenakte_embed(customer_id, customer_data)
         thread = await forum_channel.create_thread(
-            name=f" {customer_id} | {rp_name}", **ev(embed, ping=user.mention)
+            name=f"{customer_id} | {rp_name}", **ev(embed, ping=user.mention)
         )
         customer_data["thread_id"] = thread.thread.id
         data["customers"][customer_id] = customer_data
@@ -3252,7 +3304,7 @@ async def add_insurance_to_customer(interaction: discord.Interaction, customer_i
     view = AddInsuranceView(existing)
     e = DEmbed(
         title="Versicherung nachbuchen",
-        description=f"Kunde: **{customer['rp_name']}** (`{customer_id}`)\n\nBitte wähle die hinzuzufügenden Versicherungen.",
+        description=f"Kunde: **{customer['rp_name']}** (`{customer_id}`)\n\nBitte wählen Sie die hinzuzufügenden Versicherungen.",
         color=EMBED_COLOR,
     )
     await interaction.response.send_message(ephemeral=True, **ev(e, view=view))
@@ -3381,14 +3433,14 @@ async def create_invoice(
 
         invoice_id = generate_invoice_id()
         betrag_netto = customer["total_monthly_price"]
-        steuer_prozent = config.get("steuer_prozent", 3.0)
+        steuer_prozent = STEUER_PROZENT
         steuer = betrag_netto * (steuer_prozent / 100)
         betrag_brutto = betrag_netto + steuer
         due_date = get_now() + timedelta(days=3)
         ins_types = get_insurance_types()
 
         embed = DEmbed(
-            title=f"Versicherungsrechnung - {get_now().strftime('%d.%m.%Y')}",
+            title=f"Versicherungsrechnung - {dtd(get_now())}",
             description="Dies ist eine Zahlungsaufforderung für Ihre Versicherungsbeiträge!",
             color=EMBED_COLOR,
             timestamp=get_now(),
@@ -3404,8 +3456,8 @@ async def create_invoice(
             inline=False,
         )
         embed.add_field(
-            name="Zahlungsmethode",
-            value=f"> <:hbpay:1522597775647178905> `{customer['hbpay_nummer']}`",
+            name="Zahlungsmittel",
+            value=f"> <:hbpay:1522597775647178905> `{get_zahlungsmittel(customer)}`",
             inline=False,
         )
         ins_details = "\n".join(
@@ -3421,7 +3473,7 @@ async def create_invoice(
             inline=False,
         )
         embed.add_field(
-            name=f"Steuer ({steuer_prozent}%)",
+            name=f"Steuer ({steuer_prozent:g} %)",
             value=f"> `+ {steuer:,.2f}€`",
             inline=False,
         )
@@ -3432,7 +3484,7 @@ async def create_invoice(
         )
         embed.add_field(
             name="Status: Zahlung ausstehend!",
-            value=f"> <:9708withoutavoice:1522597896086618292> **{due_date.strftime('%d.%m.%Y')}**",
+            value=f"> <:9708withoutavoice:1522597896086618292> **{dtd(due_date)}**",
             inline=False,
         )
 
@@ -3475,9 +3527,7 @@ async def create_invoice(
         s = dvg_embed("Rechnung erfolgreich ausgestellt!")
         s.add_field(name="Rechnungsnummer", value=f"> `{invoice_id}`", inline=True)
         s.add_field(name="Betrag", value=f"> `{betrag_brutto:,.2f}€`", inline=True)
-        s.add_field(
-            name="Fällig", value=f"> {due_date.strftime('%d.%m.%Y')}", inline=True
-        )
+        s.add_field(name="Fällig", value=f"> {dtd(due_date)}", inline=True)
         await interaction.followup.send(ephemeral=True, **ev(s))
     except Exception as e:
         logger.error(f"Rechnung Fehler: {e}", exc_info=True)
@@ -3493,7 +3543,7 @@ async def create_invoice(
     name="rechnung-archivieren",
     description="Markiert eine Rechnung als bezahlt – setzt das Auszahlungslimit zurück",
 )
-@app_commands.describe(invoice_id="Rechnungsnummer (z.B. RE-2412-A3F9)")
+@app_commands.describe(invoice_id="Rechnungsnummer (z. B. RE-2412-A3F9)")
 @app_commands.autocomplete(invoice_id=invoice_id_autocomplete)
 async def archive_invoice(interaction: discord.Interaction, invoice_id: str):
     if not is_mitarbeiter(interaction):
@@ -3560,7 +3610,7 @@ async def archive_invoice(interaction: discord.Interaction, invoice_id: str):
                             (
                                 "Status",
                                 "Status: Bezahlt!",
-                                f"> <:datetime:1522597873286512777> **{get_now().strftime('%d.%m.%Y, %H:%M Uhr')}**\n> <:5554authapppermission:1522597727341646024> {interaction.user.mention}",
+                                f"> <:datetime:1522597873286512777> **{dts(get_now())}**\n> <:5554authapppermission:1522597727341646024> {interaction.user.mention}",
                             )
                         ],
                         color=COLOR_SUCCESS,
@@ -3802,7 +3852,7 @@ async def archive_customer(interaction: discord.Interaction, customer_id: str):
                 ) or await interaction.guild.fetch_channel(thread_id)
                 if thread:
                     await thread.edit(
-                        name=f" [ARCHIV] {customer_id} | {customer['rp_name']}"
+                        name=f"[ARCHIV] {customer_id} | {customer['rp_name']}"
                     )
                     ae = dvg_embed(
                         "Akte archiviert!", "Diese Kundenakte wurde archiviert."
@@ -3814,7 +3864,7 @@ async def archive_customer(interaction: discord.Interaction, customer_id: str):
                     )
                     ae.add_field(
                         name="Datum",
-                        value=f"> {get_now().strftime('%d.%m.%Y, %H:%M Uhr')}",
+                        value=f"> {dts(get_now())}",
                         inline=True,
                     )
                     await thread.send(**ev(ae))
@@ -3915,13 +3965,13 @@ class AuszahlungAntragsModal(discord.ui.Modal, title="Auszahlungsantrag"):
             az_channel_id = config.get("auszahlung_channel_id")
             if not az_channel_id:
                 await interaction.followup.send(
-                    ephemeral=True, **ev_text(" Auszahlungs-Kanal nicht konfiguriert.")
+                    ephemeral=True, **ev_text(" Auszahlungskanal nicht konfiguriert.")
                 )
                 return
             az_channel = interaction.guild.get_channel(az_channel_id)
             if not az_channel:
                 await interaction.followup.send(
-                    ephemeral=True, **ev_text(" Auszahlungs-Kanal nicht gefunden.")
+                    ephemeral=True, **ev_text(" Auszahlungskanal nicht gefunden.")
                 )
                 return
 
@@ -4405,7 +4455,7 @@ class InaktivitätsWarnView(EView):
                 **ev(
                     build_error_embed(
                         "Zugriff verweigert!",
-                        "Nur Mitarbeiter oder der Versicherungsnehmer können das abbrechen.",
+                        "Nur Mitarbeiter oder der Versicherungsnehmer können das automatische Schließen abbrechen.",
                     )
                 ),
             )
@@ -4477,7 +4527,7 @@ class CloseRequestView(EView):
                 **ev(
                     build_error_embed(
                         "Fehler!",
-                        "Ticket-Daten nicht gefunden. Bitte wende dich an einen Administrator.",
+                        "Ticket-Daten nicht gefunden. Bitte wenden Sie sich an einen Administrator.",
                     )
                 ),
             )
@@ -4522,7 +4572,7 @@ class CloseRequestView(EView):
                 **ev(
                     build_error_embed(
                         "Fehler!",
-                        "Ticket-Daten nicht gefunden. Bitte wende dich an einen Administrator.",
+                        "Ticket-Daten nicht gefunden. Bitte wenden Sie sich an einen Administrator.",
                     )
                 ),
             )
@@ -4587,7 +4637,7 @@ async def send_close_request(
 async def reenable_close_request_button(
     channel: discord.abc.Messageable, ticket_info: dict
 ) -> None:
-    """Aktiviert den Schließanfrage-Button im Ticket-Panel wieder (z.B. nach Ablehnung)."""
+    """Aktiviert den Schließanfrage-Button im Ticket-Panel wieder (z. B. nach Ablehnung)."""
     panel_msg_id = ticket_info.get("close_request_panel_message_id")
     if not panel_msg_id:
         return
@@ -4647,7 +4697,7 @@ class SchadensmeldungTicketView(EView):
                 **ev(
                     build_error_embed(
                         "Fehler!",
-                        "Ticket-Daten nicht gefunden. Bitte wende dich an einen Administrator.",
+                        "Ticket-Daten nicht gefunden. Bitte wenden Sie sich an einen Administrator.",
                     )
                 ),
             )
@@ -4912,7 +4962,7 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
                     **ev(
                         build_error_embed(
                             "Aktives Ticket vorhanden!",
-                            f"Du hast bereits ein offenes Kundenkontakt-Ticket (<#{existing_ma}>).\nBitte schließe dieses zuerst.",
+                            f"Sie haben bereits ein offenes Kundenkontakt-Ticket (<#{existing_ma}>).\nBitte schließen Sie dieses zuerst.",
                         )
                     ),
                 )
@@ -4997,7 +5047,7 @@ class TicketModal(discord.ui.Modal, title="Kundenkontakt-Anfrage"):
                 value=(
                     f"> <:member:1522597880437932112> `{customer['rp_name']}`\n"
                     f"> <:id:1522597735205830666> `{customer_id}`\n"
-                    f"> <:datetime:1522597873286512777> `{get_now().strftime('%d.%m.%Y, %H:%M')} Uhr`\n"
+                    f"> <:datetime:1522597873286512777> {dts(get_now())}\n"
                 ),
                 inline=False,
             )
@@ -5117,18 +5167,16 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
             # ── Blacklist-Check ──
             bl = blacklist_entry(customer_id)
             if bl:
-                added = make_aware(datetime.fromisoformat(bl["added_at"])).strftime(
-                    "%d.%m.%Y"
-                )
+                added = dtd(make_aware(datetime.fromisoformat(bl["added_at"])))
                 bl_e = dvg_embed(
                     "Einreichung abgelehnt",
-                    "> Für diesen Versicherungsnehmer koennen keine Schadensmeldungen eingereicht werden.\n"
-                    "> Bitte wende dich an die Leitungsebene für weitere Informationen.",
+                    "> Für diesen Versicherungsnehmer können keine Schadensmeldungen eingereicht werden.\n"
+                    "> Bitte wenden Sie sich an die Leitungsebene für weitere Informationen.",
                 )
                 bl_e.add_field(
                     name="Kunden-ID", value=f"> `{customer_id}`", inline=True
                 )
-                bl_e.add_field(name="Gesperrt seit", value=f"> `{added}`", inline=True)
+                bl_e.add_field(name="Gesperrt seit", value=f"> {added}", inline=True)
                 await interaction.followup.send(ephemeral=True, **ev(bl_e))
                 add_log_entry(
                     "BLACKLIST_BLOCK",
@@ -5145,7 +5193,7 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
                     **ev(
                         build_error_embed(
                             "Aktive Schadensmeldung vorhanden!",
-                            f"Für **{customer['rp_name']}** existiert bereits eine offene Schadensmeldung (<#{existing}>).\nBitte warte, bis diese bearbeitet wurde.",
+                            f"Für **{customer['rp_name']}** existiert bereits eine offene Schadensmeldung (<#{existing}>).\nBitte warten Sie, bis diese bearbeitet wurde.",
                         )
                     ),
                 )
@@ -5158,9 +5206,7 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
                 dup_cid = duplicate.get("customer_id", "—")
                 dup_date = duplicate.get("datum", "")
                 dup_dt = (
-                    make_aware(datetime.fromisoformat(dup_date)).strftime(
-                        "%d.%m.%Y %H:%M"
-                    )
+                    dts(make_aware(datetime.fromisoformat(dup_date)))
                     if dup_date
                     else "—"
                 )
@@ -5173,7 +5219,7 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
                     name="Nachweis", value=f"> `{nachweis_val[:100]}`", inline=False
                 )
                 fraud_e.add_field(
-                    name="Erstmalig eingereicht am", value=f"> `{dup_dt}`", inline=True
+                    name="Erstmalig eingereicht am", value=f"> {dup_dt}", inline=True
                 )
                 fraud_e.add_field(
                     name="Kunden-ID (original)", value=f"> `{dup_cid}`", inline=True
@@ -5240,7 +5286,7 @@ class SchadensmeldungModal(discord.ui.Modal, title="Schadensmeldung einreichen")
                 value=(
                     f"> <:member:1522597880437932112> `{customer['rp_name']}`\n"
                     f"> <:id:1522597735205830666> `{customer_id}`\n"
-                    f"> <:datetime:1522597873286512777> `{get_now().strftime('%d.%m.%Y, %H:%M Uhr')}`"
+                    f"> <:datetime:1522597873286512777> {dts(get_now())}"
                 ),
                 inline=False,
             )
@@ -5448,15 +5494,13 @@ async def show_logs(interaction: discord.Interaction, anzahl: int = 10):
             timestamp=get_now(),
         )
         for log in recent:
-            ts = make_aware(datetime.fromisoformat(log["timestamp"])).strftime(
-                "%d.%m.%Y, %H:%M Uhr"
-            )
+            ts = dts(make_aware(datetime.fromisoformat(log["timestamp"])))
             user = (
                 interaction.guild.get_member(log["user_id"])
                 if log.get("user_id") and log["user_id"] != 0
                 else None
             )
-            user_name = user.mention if user else "System System"
+            user_name = user.mention if user else "System"
             emoji, display = action_map.get(log["action"], ("", log["action"]))
             details = log.get("details", {})
             parts = []
@@ -5547,7 +5591,7 @@ async def show_customer(
     )
     embed.add_field(
         name="Stammdaten",
-        value=f"> <:member:1522597880437932112> `{customer['rp_name']}`\n> <:id:1522597735205830666> `{customer_id}`\n> <:hbpay:1522597775647178905> `{customer['hbpay_nummer']}`",
+        value=f"> <:member:1522597880437932112> `{customer['rp_name']}`\n> <:id:1522597735205830666> `{customer_id}`\n> <:hbpay:1522597775647178905> `{get_zahlungsmittel(customer)}`",
         inline=False,
     )
 
@@ -5594,7 +5638,7 @@ async def show_customer(
 
     embed.add_field(
         name="Systemdaten (Erstellung)",
-        value=f"> <:datetime:1522597873286512777> {make_aware(datetime.fromisoformat(customer['created_at'])).strftime('%d.%m.%Y, %H:%M Uhr')}\n> <:mitarbeiter:1522597807352057928> <@{customer['discord_user_id']}>",
+        value=f"> <:datetime:1522597873286512777> {dts(make_aware(datetime.fromisoformat(customer['created_at'])))}\n> <:mitarbeiter:1522597807352057928> <@{customer['discord_user_id']}>",
         inline=False,
     )
     await interaction.response.send_message(
@@ -5695,7 +5739,7 @@ async def show_stats(interaction: discord.Interaction):
 # ═══════════════════════════════════════════════════════
 @bot.tree.command(
     name="schaden-historie",
-    description="Zeigt die Schadenhistorie eines Versicherungsnehmers",
+    description="Zeigt die Schadenshistorie eines Versicherungsnehmers",
 )
 @app_commands.describe(customer_id="Versicherungsnehmer-ID")
 @app_commands.autocomplete(customer_id=customer_id_autocomplete)
@@ -5740,9 +5784,7 @@ async def cmd_schaden_historie(interaction: discord.Interaction, customer_id: st
             :10
         ]:
             datum = (
-                make_aware(datetime.fromisoformat(entry["datum"])).strftime(
-                    "%d.%m.%Y %H:%M"
-                )
+                dts(make_aware(datetime.fromisoformat(entry["datum"])))
                 if entry.get("datum")
                 else "—"
             )
@@ -5751,7 +5793,7 @@ async def cmd_schaden_historie(interaction: discord.Interaction, customer_id: st
             )
             closed_dt = ""
             if entry.get("closed_at"):
-                closed_dt = f"\n> Abgeschlossen: `{make_aware(datetime.fromisoformat(entry['closed_at'])).strftime('%d.%m.%Y %H:%M')}`"
+                closed_dt = f"\n> Abgeschlossen: {dts(make_aware(datetime.fromisoformat(entry['closed_at'])))}"
             e.add_field(
                 name=f"`{entry.get('id', '—')}` — {datum}",
                 value=(
@@ -5766,7 +5808,7 @@ async def cmd_schaden_historie(interaction: discord.Interaction, customer_id: st
     if len(history) > 10:
         e.add_field(
             name="Hinweis",
-            value=f"> Zeige die letzten 10 von {len(history)} Einträgen.",
+            value=f"> Es werden die letzten 10 von {len(history)} Einträgen angezeigt.",
             inline=False,
         )
 
@@ -5864,14 +5906,12 @@ async def cmd_blacklist_add(
 
     customer = data["customers"][customer_id]
     e = dvg_embed(
-        "Kunde zur Blacklist hinzugefuegt",
+        "Kunde zur Blacklist hinzugefügt",
         f"> **{customer['rp_name']}** (`{customer_id}`) wurde gesperrt.",
     )
     e.add_field(name="Grund", value=f"> {grund}", inline=False)
     e.add_field(name="Gesperrt von", value=f"> {interaction.user.mention}", inline=True)
-    e.add_field(
-        name="Datum", value=f"> `{get_now().strftime('%d.%m.%Y %H:%M')}`", inline=True
-    )
+    e.add_field(name="Datum", value=f"> {dts(get_now())}", inline=True)
     await interaction.response.send_message(ephemeral=True, **ev(e))
     await send_to_log_channel(interaction.guild, e)
     add_log_entry(
@@ -5946,9 +5986,7 @@ async def cmd_blacklist_liste(interaction: discord.Interaction):
         for cid, entry in list(bl.items())[:20]:
             cust = data["customers"].get(cid, {})
             added = (
-                make_aware(datetime.fromisoformat(entry["added_at"])).strftime(
-                    "%d.%m.%Y"
-                )
+                dtd(make_aware(datetime.fromisoformat(entry["added_at"])))
                 if entry.get("added_at")
                 else "—"
             )
@@ -5957,7 +5995,7 @@ async def cmd_blacklist_liste(interaction: discord.Interaction):
                 name=f"{cust.get('rp_name', 'Unbekannt')} — `{cid}`",
                 value=(
                     f"> <:taeter:1522597859109900328>  {entry.get('grund', '*N/A*')}\n"
-                    f"> <:3156editsecurityactions:1522597767359496202> `{added}` von {adder.mention if adder else '*N/A*'}"
+                    f"> <:3156editsecurityactions:1522597767359496202> {added} von {adder.mention if adder else '*N/A*'}"
                 ),
                 inline=False,
             )
@@ -6019,7 +6057,7 @@ async def auto_backup():
         e = dvg_embed("Automatisches Datenbank-Backup")
         e.add_field(
             name="Information",
-            value="> Alle `24 Stunden` werden die Daten gesichert.",
+            value="> Die Daten werden alle `24 Stunden` gesichert.",
             inline=False,
         )
         e.add_field(
@@ -6029,7 +6067,7 @@ async def auto_backup():
         )
         e.add_field(
             name="Zeitstempel",
-            value=f"> {get_now().strftime('%d.%m.%Y, %H:%M:%S Uhr')}",
+            value=f"> {dts(get_now())}",
             inline=False,
         )
         for guild in bot.guilds:
@@ -6056,7 +6094,7 @@ def build_schadensmeldung_panel_embed() -> DEmbed:
     """Panel-Inhalt für das Schadensmeldungs-Panel (inkl. aktueller Bearbeitungszeit)."""
     embed_sm = dvg_embed(
         "Schadensmeldung",
-        "Liebe Versicherungsnehmer:innen,\n> hier können sie Schadensmeldungen einreichen.",
+        "Liebe Versicherungsnehmer:innen,\n> hier können Sie Schadensmeldungen einreichen.",
     )
     embed_sm.add_field(
         name="Wie funktioniert das System?",
@@ -6078,9 +6116,11 @@ def build_schadensmeldung_panel_embed() -> DEmbed:
         avg_m = int(sum(s["duration_minutes"] for s in sm_stats) / len(sm_stats))
         h, m = divmod(avg_m, 60)
         avg_tx = f"`{h}h {m}min`" if h else f"`{m} Minuten`"
-        bearbzeit = f"> Voraussichtliche Bearbeitungszeit: {avg_tx}\n> Basierend auf {len(sm_stats)} abgeschlossenen Vorgängen."
+        bearbzeit = f"> Voraussichtlich {avg_tx}\n> Basierend auf {len(sm_stats)} abgeschlossenen Vorgängen."
     else:
-        bearbzeit = "> Voraussichtliche Bearbeitungszeit: *N/A*"
+        bearbzeit = (
+            "> Noch nicht berechenbar, da noch keine Vorgänge abgeschlossen wurden."
+        )
     embed_sm.add_field(name="Bearbeitungszeit", value=bearbzeit, inline=False)
     embed_sm.big = True
     return embed_sm
